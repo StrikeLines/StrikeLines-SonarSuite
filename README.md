@@ -1,5 +1,54 @@
 
-# SidescanTools
+# SidescanTools — StrikeLines Fork
+
+> This repository is a Windows-focused fork of
+> [sonoware/sidescantools](https://github.com/sonoware/sidescantools). It
+> preserves the original processing, Napari, CLI, and GeoTIFF workflows while
+> adding a Qt raster workspace for contact picking, bottom-line editing, and
+> interactive gain adjustment.
+
+## What this fork adds
+
+- **Windows-friendly Qt waterfall viewer.** A continuous, OpenGL-free Qt
+  raster viewer provides a practical fallback on Windows systems where Napari
+  or its OpenGL stack is unavailable or unreliable. Napari has not been
+  removed; it remains available for the original workflows. The Qt viewer is
+  selected automatically by the contact-picker launcher on Windows and can
+  also be requested explicitly.
+- **Persistent sonar contact picker.** Click a return in the waterfall to save
+  a contact, then add a name and notes. Contacts are stored in a reusable SQLite
+  project database with their source file, ping, channel, sample position,
+  display intensity, geometry settings, and generated thumbnail. A single
+  database can span multiple survey files.
+- **Coordinate-safe contact export.** Contact positions use the same swath
+  geometry as GeoTIFF generation, including channel orientation, downsampling,
+  layback/cable-out, and sensor offsets. Stale coordinates can be recomputed
+  after geometry settings change, and valid WGS 84 contacts can be exported as
+  GPX waypoints.
+- **Fine-grained display gain and TVG.** The Qt waterfall exposes overall gain,
+  logarithmic spreading compensation, linear absorption compensation, and
+  along-track display scale. The **Normalize** action equalizes typical
+  brightness across port and starboard, raises dark regions, reduces blown-out
+  regions, and targets the middle of the visible range while using an overall
+  gain baseline of approximately -10 dB.
+- **Integrated processing controls.** Switch the display between raw,
+  slant-range corrected, Beam Angle Correction (BAC), and Empirical Gain
+  Normalization (EGN) data. The Qt workflow also includes EGN table selection
+  and a multi-file EGN table builder.
+- **Overhauled bottom-line workflow.** View and edit the bottom line directly
+  over the continuous waterfall, recalculate the current chunk or whole file,
+  refine it using logged sensor altitude, and choose how port and starboard
+  edits are combined. Changes auto-save beside the sonar file as
+  `<name>_bottom_info.npz` and use the same format as the CLI and EGN tools.
+- **Multi-file project workflow.** Open files directly or move to the previous
+  and next JSF/XTF file in a folder while retaining the contact database and
+  session display settings. An optional redesigned Qt layout is available with
+  `--ui v2`.
+- **Processing and geometry reliability work.** The fork adds shared
+  bottom-line I/O, endpoint-preserving sample mapping, JSF/XTF orientation
+  checks, downsampling-aware correction paths, and parity tests tying contact
+  coordinates and processing results back to the existing georeferencing
+  pipeline.
 
 SidescanTools is an open-source software to read and <br />
 <img align="right" width="250" height="250" src="./src/sidescantools/res/sidescantools_logo_rund.png" hspace="25" title="Logo design and artwork by Aili Xue">
@@ -33,26 +82,73 @@ The main processing steps of SidescanTools are:
    - Export data as **georeferenced image** to view on a map
    - If only a simple image is needed, a waterfall image can also be exported
 
-# Getting Started
-* SidescanTools may be used with **full feature extent** as [graphical tool](#gui-usage) (GUI)
-* You may also use the [**command-line interface**](#cli-usage) (CLI) for (batch) processing of data with altitude information
+# Installation
 
-<!-- Uncomment the following when the conda package is built: -->
-<!-- 1. Preferably create a new conda environment
-2. In this environment, install the conda package via: `conda install conda-forge::sidescantools`
-3. Start SidescanTools GUI: `sidescantools_gui` or CLI: `sidescantools_cli`
+Python 3.12 is required. Miniconda or Anaconda is strongly recommended because
+GDAL, PyGMT, Qt, Napari, and the geospatial libraries are substantially easier
+to install from Conda than from PyPI on Windows.
 
-Otherwise, you can execute the source code by the following steps (they apply to both variants): -->
-1. Clone this git repository
-2. Install required packages in a new environment:
-   - For GUI, use `environment.yml`: `conda env create -f environment.yml`
-   - For CLI, use `environment_cli.yml`: `conda env create -f environment_cli.yml`
+## Full GUI and Qt contact-picker environment
 
-   We recommend to use Anaconda/Miniconda for platform-independent installation to ensure GDAL and other dependencies are installed correctly.
+Open **Anaconda Prompt** or a Conda-enabled PowerShell and run:
 
-3. In the virtual environment, install the package locally via pip: `pip install -e .`
-4. Start the GUI: `python src/sidescantools/main_gui.py` \
- or CLI: `python src/sidescantools/main_cli.py file_or_folder_path project_info.yml`
+```powershell
+git clone https://github.com/StrikeLines/sidescantools.git
+cd sidescantools
+conda env create -f environment.yml
+conda activate env_sidescantools
+python -m pip install -e .
+```
+
+To update an existing checkout after the environment has already been created:
+
+```powershell
+git pull
+conda activate env_sidescantools
+python -m pip install -e .
+```
+
+## Start the Qt contact picker
+
+Open a file picker on launch:
+
+```powershell
+sidescantools-contacts --viewer qt
+```
+
+Or open a JSF/XTF file directly:
+
+```powershell
+sidescantools-contacts "C:\path\to\survey.jsf" --viewer qt
+```
+
+The classic Qt layout is the default. To try the redesigned preview:
+
+```powershell
+sidescantools-contacts "C:\path\to\survey.jsf" --viewer qt --ui v2
+```
+
+Useful optional arguments include `--contacts-db` for a specific SQLite
+project, `--work-dir` for outputs, and geometry controls such as `--cable-out`,
+`--x-offset`, and `--y-offset`. Run `sidescantools-contacts --help` for the full
+list. On Windows, `--viewer auto` also selects the Qt viewer automatically.
+
+## Start the original workflows
+
+The original project GUI and CLI remain available:
+
+```powershell
+python src/sidescantools/main_gui.py
+python src/sidescantools/main_cli.py file_or_folder_path project_info.yml
+```
+
+For a CLI-only environment without Qt or Napari, use:
+
+```powershell
+conda env create -f environment_cli.yml
+conda activate env_sidescantools_cli
+python -m pip install -e .
+```
 
 # GUI Usage
 The GUI tool works based on a project directory, which can be set via the `Working directory` button.
@@ -132,7 +228,7 @@ Therefore only the python packages defined in `environment_cli.yml` are required
 
 To process a file or a directory, use the following command:
 ```
-python main_cli.py file_or_folder_path project_info.yml
+python src/sidescantools/main_cli.py file_or_folder_path project_info.yml
 ```
 
 This command processes the specified file or all files within the folder, using the settings defined in the provided `project_info.yml` file.
