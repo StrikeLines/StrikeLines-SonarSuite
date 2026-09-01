@@ -6,6 +6,22 @@ import numpy as np
 from sidescantools.sidescan_file import SidescanFile
 import os
 
+from sidescantools.interaction_mode import InteractionMode, InteractionModeController
+from sidescantools.bottom_line_io import (
+    compute_depth_info,
+    save_bottom_info,
+    load_bottom_info,
+)
+from sidescantools.contact_picker import (
+    ContactPickerService,
+    display_position_for_anchor,
+)
+from sidescantools.contact_store import ContactStore, DuplicateContactAnchor
+from sidescantools.contact_thumbnail import ContactThumbnailExtractor
+from sidescantools.contact_ui import ContactDock
+from sidescantools.georef_thread import Georeferencer
+from sidescantools.swath_geometry import GeometrySettings
+
 
 def run_napari_btm_line(
     filepath: str | os.PathLike,
@@ -16,6 +32,10 @@ def run_napari_btm_line(
     work_dir=None,
     active_dB=False,
     active_hist_equal=False,
+    contact_pick_callback=None,
+    contacts_db_path=None,
+    geometry_settings=None,
+    block=True,
 ):
     """Run bottom line detection in napari on a given file
 
@@ -33,9 +53,15 @@ def run_napari_btm_line(
         Path to desired directory that is used as default directory for saving/loading of results to ``.npz`` files
     active_dB: bool
         If ``True`` data will be converted to dB for display in napari
+    contact_pick_callback: callable | None
+        Optional persistence callback receiving one rounded data position. If it
+        returns a contact record, a marker is added after the callback succeeds.
     """
     filepath = Path(filepath)
     add_line_width = 1  # additional line width for plotting of bottom line
+    interaction_modes = InteractionModeController()
+    if geometry_settings is None:
+        geometry_settings = GeometrySettings(vertical_beam_angle=60)
 
     sidescan_file = SidescanFile(filepath)
     preproc = SidescanPreprocessor(
@@ -45,18 +71,7 @@ def run_napari_btm_line(
     )
 
     # Init bottom detection by doing an initial guess
-    # check if depth is valid
-    depth_info = sidescan_file.depth
-    if depth_info[0] == 0:
-        depth_info = None
-    else:
-        # convert to ping idx
-        for ping_idx in range(sidescan_file.num_ping):
-            depth_info[ping_idx] = np.round(
-                np.argmin(np.abs(depth_info[ping_idx] - sidescan_file.ping_x_axis))
-                / downsampling_factor
-            )
-        depth_info = depth_info.astype(int)
+    depth_info = compute_depth_info(sidescan_file, downsampling_factor)
 
     print("Initializing napari UI for Bottom Detection")
     preproc.init_napari_bottom_detect(
@@ -123,11 +138,14 @@ def run_napari_btm_line(
     # Build widget for aux parameters that shall not trigger a recalculation for the current chunk
     @magicgui(auto_call=True, call_button=None)
     def manual_annotation_widget(activate_manual_annotation: bool):
-        for layer in viewer.layers:
-            if activate_manual_annotation:
-                layer.mouse_pan = False
-            else:
-                layer.mouse_pan = True
+        if activate_manual_annotation:
+            interaction_modes.set_mode(InteractionMode.BOTTOM_EDIT)
+        elif interaction_modes.mode is InteractionMode.BOTTOM_EDIT:
+            interaction_modes.set_mode(InteractionMode.PAN_ZOOM)
+
+    @magicgui(auto_call=False, call_button=None)
+    def interaction_mode_widget(active_mode: str = "Pan/Zoom"):
+        pass
 
     # Build saving and loading widgets using simple npz file
     if work_dir is None:
@@ -140,84 +158,14 @@ def run_napari_btm_line(
     def filepicker_save(
         filename=default_bottom_path,
     ):
-        # only save real data information
-        info_port = preproc.napari_portside_bottom.flatten()[: sidescan_file.num_ping]
-        info_star = preproc.napari_starboard_bottom.flatten()[: sidescan_file.num_ping]
-
-        # detect and remove outliers
-        sample_thresh = 5
-        for ping_idx in range(sidescan_file.num_ping):
-            if 0 < ping_idx < sidescan_file.num_ping - 1:
-                dist1 = info_port[ping_idx] - info_port[ping_idx - 1]
-                dist2 = info_port[ping_idx] - info_port[ping_idx + 1]
-                if (
-                    np.abs(dist1) > sample_thresh
-                    and np.abs(dist2) > sample_thresh
-                    and dist1 * dist2 > 0
-                ):
-                    info_port[ping_idx] = int(
-                        (info_port[ping_idx - 1] + info_port[ping_idx + 1]) / 2
-                    )
-                dist1 = info_star[ping_idx] - info_star[ping_idx - 1]
-                dist2 = info_star[ping_idx] - info_star[ping_idx + 1]
-                if (
-                    np.abs(dist1) > sample_thresh
-                    and np.abs(dist2) > sample_thresh
-                    and dist1 * dist2 > 0
-                ):
-                    info_star[ping_idx] = int(
-                        (info_star[ping_idx - 1] + info_star[ping_idx + 1]) / 2
-                    )
-        # flip order for xtf files to contain backwards compability
-        if filepath.suffix.casefold() == ".xtf":
-            info_port = np.flip(info_port)
-            info_star = np.flip(info_star)
-        np.savez(
-            filename,
-            bottom_info_port=info_port,
-            bottom_info_star=info_star,
-            downsampling_factor=preproc.downsampling_factor,
-        )
+        save_bottom_info(filename, preproc, sidescan_file)
 
     @magicgui(filename={"mode": "r"}, call_button="Load")
     def filepicker_load(
         filename=default_bottom_path,
     ):
         if filename.exists() and filename.suffix == ".npz":
-            bottom_info = np.load(filename)
-            napari_portside_bottom = bottom_info["bottom_info_port"]
-            napari_portside_bottom = napari_portside_bottom.flatten()
-            napari_starboard_bottom = bottom_info["bottom_info_star"]
-            napari_starboard_bottom = napari_starboard_bottom.flatten()
-            # flip order for xtf files to contain backwards compability
-            if filepath.suffix.casefold() == ".xtf":
-                napari_portside_bottom[: sidescan_file.num_ping] = np.flip(
-                    napari_portside_bottom[: sidescan_file.num_ping]
-                )
-                napari_starboard_bottom[: sidescan_file.num_ping] = np.flip(
-                    napari_starboard_bottom[: sidescan_file.num_ping]
-                )
-
-            for chunk_idx in range(preproc.num_chunk):
-                port_chunk = napari_portside_bottom[
-                    chunk_idx
-                    * preproc.chunk_size : (chunk_idx + 1)
-                    * preproc.chunk_size
-                ]
-                preproc.napari_portside_bottom[chunk_idx, : len(port_chunk)] = (
-                    port_chunk
-                )
-                star_chunk = napari_starboard_bottom[
-                    chunk_idx
-                    * preproc.chunk_size : (chunk_idx + 1)
-                    * preproc.chunk_size
-                ]
-                preproc.napari_starboard_bottom[chunk_idx, : len(star_chunk)] = (
-                    star_chunk
-                )
-                preproc.update_bottom_map_napari(
-                    chunk_idx, add_line_width=add_line_width
-                )
+            load_bottom_info(filename, preproc, sidescan_file)
             bottom_image_layer.refresh()
 
     viewer = napari.Viewer(title="SidescanTools - Bottom line detection")
@@ -225,9 +173,15 @@ def run_napari_btm_line(
     # add custom shortcuts
     @viewer.bind_key("m")
     def press_m(viewer):
-        manual_annotation_widget.activate_manual_annotation.value = (
-            not manual_annotation_widget.activate_manual_annotation.value
-        )
+        interaction_modes.toggle(InteractionMode.BOTTOM_EDIT)
+
+    @viewer.bind_key("t")
+    def press_t(viewer):
+        interaction_modes.toggle(InteractionMode.TARGET_PICK)
+
+    @viewer.bind_key("Escape")
+    def press_escape(viewer):
+        interaction_modes.set_mode(InteractionMode.PAN_ZOOM)
 
     @viewer.bind_key("r")
     def press_r(viewer):
@@ -261,6 +215,139 @@ def run_napari_btm_line(
     bottom_image_layer = viewer.add_image(
         preproc.bottom_map, name="bottom_map", colormap=bottom_colormap
     )
+    contacts_layer = viewer.add_points(
+        np.empty((0, 3)),
+        name="Contacts",
+        size=12,
+        face_color="cyan",
+        edge_color="white",
+    )
+
+    # Project contact persistence is initialized with the dock. Geometry itself
+    # remains lazy and is prepared off the UI thread on first Target Pick use.
+    if contacts_db_path is None:
+        contact_root = Path(work_dir) if work_dir is not None else filepath.parent
+        contacts_db_path = contact_root / "contacts.sqlite"
+    contact_store = ContactStore(contacts_db_path)
+    source_stat = filepath.stat()
+    contact_source = contact_store.register_source_file(
+        filepath,
+        format=filepath.suffix.lstrip("."),
+        ping_count=sidescan_file.num_ping,
+        source_sample_count=sidescan_file.ping_len,
+        file_size_bytes=source_stat.st_size,
+        mtime_ns=source_stat.st_mtime_ns,
+    )
+    geometry_profile_id = contact_store.get_or_create_geometry_profile(
+        geometry_settings
+    )
+    contact_store.mark_stale_for_profile(contact_source.id, geometry_profile_id)
+    contact_dock = ContactDock(
+        contact_store,
+        contact_source.id,
+        export_directory=Path(contacts_db_path).parent,
+    )
+    viewer.window.add_dock_widget(contact_dock, name="Sonar Contacts", area="right")
+    contact_runtime = {"worker": None, "picker": None}
+
+    def rebuild_contact_markers(*args):
+        markers = [
+            display_position_for_anchor(
+                record.draft.anchor,
+                chunk_size=preproc.chunk_size,
+                display_channel_width=preproc.ping_len,
+            )
+            for record in contact_store.list_contacts(
+                source_file_id=contact_source.id
+            )
+        ]
+        contacts_layer.data = (
+            np.asarray(markers, dtype=float) if markers else np.empty((0, 3))
+        )
+
+    rebuild_contact_markers()
+    contact_dock.contact_deleted.connect(rebuild_contact_markers)
+
+    def start_contact_geometry():
+        nonlocal contact_pick_callback
+        if contact_runtime["picker"] is not None:
+            return
+        worker = contact_runtime["worker"]
+        if worker is not None and worker.is_running:
+            return
+        from napari.qt.threading import thread_worker
+
+        @thread_worker
+        def prepare_geometry():
+            prepared = {}
+            for channel in (0, 1):
+                georeferencer = Georeferencer(
+                    filepath,
+                    channel=channel,
+                    sidescan_file=sidescan_file,
+                    geometry_settings=geometry_settings,
+                    output_folder=filepath.parent,
+                )
+                prepared[channel] = georeferencer.prepare_swath_geometry()
+            return prepared
+
+        def geometry_ready(prepared):
+            nonlocal contact_pick_callback
+            thumbnail_extractor = ContactThumbnailExtractor(
+                preprocessor=preproc,
+                sidescan_file=sidescan_file,
+            )
+            picker = ContactPickerService(
+                sidescan_file=sidescan_file,
+                preprocessor=preproc,
+                source_file_id=contact_source.id,
+                geometry_profile_id=geometry_profile_id,
+                geometry_by_channel=prepared,
+                store=contact_store,
+                thumbnail_factory=thumbnail_extractor,
+            )
+            contact_runtime["picker"] = picker
+            contact_dock.set_geometry_status("Geometry ready", ready=True)
+
+            def save_contact(position):
+                chunk_index, local_ping_index, display_x = position
+                try:
+                    result = picker.pick_display_pixel(
+                        chunk_index=chunk_index,
+                        local_ping_index=local_ping_index,
+                        display_x=display_x,
+                    )
+                except DuplicateContactAnchor:
+                    viewer.status = "A contact already exists at this sonar sample"
+                    return None
+                except Exception as exc:
+                    viewer.status = f"Contact not saved: {exc}"
+                    return None
+                contact_dock.refresh_and_focus_name(select_contact_id=result.contact.id)
+                viewer.status = (
+                    result.thumbnail_warning
+                    or f"Saved {result.contact.draft.name}"
+                )
+                return result
+
+            contact_pick_callback = save_contact
+
+        def geometry_failed(error):
+            contact_dock.set_geometry_status(f"Geometry error: {error}")
+            viewer.status = f"Contact geometry failed: {error}"
+
+        contact_dock.set_geometry_status("Preparing contact geometry…")
+        worker = prepare_geometry()
+        contact_runtime["worker"] = worker
+        worker.returned.connect(geometry_ready)
+        worker.errored.connect(geometry_failed)
+        worker.start()
+
+    def prepare_on_target_mode(mode):
+        if mode is InteractionMode.TARGET_PICK:
+            start_contact_geometry()
+
+    interaction_modes.add_listener(prepare_on_target_mode)
 
     # add widgets to main window
     viewer.window.add_dock_widget(widget_thresh, name="Bottom detection parameters")
@@ -271,6 +358,7 @@ def run_napari_btm_line(
     viewer.window.add_dock_widget(
         manual_annotation_widget, name="Activate manual annotation"
     )
+    viewer.window.add_dock_widget(interaction_mode_widget, name="Interaction mode")
     viewer.window.add_dock_widget(filepicker_save, name="Save to")
     viewer.window.add_dock_widget(filepicker_load, name="Load from")
     widget_thresh.visible = True
@@ -285,12 +373,24 @@ def run_napari_btm_line(
     manual_annotation_widget.activate_manual_annotation.text = (
         "m: Activate manual annotation"
     )
+    interaction_mode_widget.active_mode.enabled = False
     filepicker_save.filename.label = "File"
     filepicker_load.filename.label = "File"
 
-    def custom_mouse_callback(layer, event):
+    def apply_interaction_mode(mode):
+        manual_active = mode is InteractionMode.BOTTOM_EDIT
+        if manual_annotation_widget.activate_manual_annotation.value != manual_active:
+            manual_annotation_widget.activate_manual_annotation.value = manual_active
+        interaction_mode_widget.active_mode.value = mode.label
+        for current_layer in viewer.layers:
+            current_layer.mouse_pan = mode is InteractionMode.PAN_ZOOM
+
+    interaction_modes.add_listener(apply_interaction_mode)
+    apply_interaction_mode(interaction_modes.mode)
+
+    def bottom_edit_mouse_callback(layer, event):
         if (
-            manual_annotation_widget.activate_manual_annotation.value
+            interaction_modes.mode is InteractionMode.BOTTOM_EDIT
             and event.button == 1
             and 0 <= np.round(event.position[1]) < layer.data.shape[1]
             and 0 <= np.round(event.position[2]) < layer.data.shape[2]
@@ -421,26 +521,70 @@ def run_napari_btm_line(
             bottom_image_layer.data = preproc.bottom_map
             # print("mouse callback ended")
 
+    def target_pick_mouse_callback(layer, event):
+        if (
+            interaction_modes.mode is not InteractionMode.TARGET_PICK
+            or contact_pick_callback is None
+            or event.button != 1
+        ):
+            return
+        dragged = False
+        yield
+        while event.type == "mouse_move":
+            dragged = True
+            yield
+        if not dragged:
+            position = event.position
+            if hasattr(layer, "world_to_data"):
+                position = layer.world_to_data(position)
+            result = contact_pick_callback(
+                tuple(np.asarray(position).round().astype(int))
+            )
+            contact = getattr(result, "contact", result)
+            draft = getattr(contact, "draft", None)
+            anchor = getattr(draft, "anchor", None)
+            if anchor is not None:
+                marker = display_position_for_anchor(
+                    anchor,
+                    chunk_size=preproc.chunk_size,
+                    display_channel_width=preproc.ping_len,
+                )
+                contacts_layer.add(np.asarray(marker)[None, :])
+
+    def interaction_dispatcher(layer, event):
+        if interaction_modes.mode is InteractionMode.BOTTOM_EDIT:
+            return bottom_edit_mouse_callback(layer, event)
+        if interaction_modes.mode is InteractionMode.TARGET_PICK:
+            return target_pick_mouse_callback(layer, event)
+        return None
+
     # Handle click or drag events separately
     @bottom_image_layer.mouse_drag_callbacks.append
     def click_drag(layer, event):
-        return custom_mouse_callback(bottom_image_layer, event)
+        return interaction_dispatcher(bottom_image_layer, event)
 
     # enable the custom callback for all layers
     @sidescan_image_layer.mouse_drag_callbacks.append
     def click_drag(layer, event):
-        return custom_mouse_callback(bottom_image_layer, event)
+        return interaction_dispatcher(sidescan_image_layer, event)
 
     @edges_image_layer.mouse_drag_callbacks.append
     def click_drag(layer, event):
-        return custom_mouse_callback(bottom_image_layer, event)
+        return interaction_dispatcher(edges_image_layer, event)
 
     @binarized_image_layer.mouse_drag_callbacks.append
     def click_drag(layer, event):
-        return custom_mouse_callback(bottom_image_layer, event)
+        return interaction_dispatcher(binarized_image_layer, event)
 
     # run main loop
-    viewer.show(block=True)
+    # Keep project objects reachable for non-blocking tests and integrations.
+    viewer._sidescantools_contact_store = contact_store
+    viewer._sidescantools_contact_dock = contact_dock
+    viewer._sidescantools_interaction_modes = interaction_modes
+    viewer.show(block=block)
+    if block:
+        contact_store.close()
+    return viewer
 
 
 if __name__ == "__main__":

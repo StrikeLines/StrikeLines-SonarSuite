@@ -14,6 +14,9 @@ authors = [
 license = "GPL-3.0"
 license-files = ["LICENSE"]
 
+[project.scripts]
+sidescantools-contacts = "sidescantools.contact_picker_app:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

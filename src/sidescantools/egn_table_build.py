@@ -5,6 +5,33 @@ import os
 import pathlib
 
 
+def accumulate_egn_bins(egn_mat, egn_hit_cnt, r_idx, alpha_idx, values, r_size, angle_num):
+    """Scatter-accumulate one ping's samples into the EGN mat/hit-count bins.
+
+    Equivalent to, for each sample i: if 0 <= r_idx[i] < r_size and
+    0 <= alpha_idx[i] < angle_num and values[i] != 0, then
+    egn_mat[r_idx[i], alpha_idx[i]] += values[i] and
+    egn_hit_cnt[r_idx[i], alpha_idx[i]] += 1. Vectorized with np.add.at
+    (unbuffered) rather than plain fancy-index += so that samples that land
+    in the same bin within one ping are correctly summed instead of only the
+    last one being kept -- a Python for-loop over every sample here was the
+    dominant cost of building an EGN table on a full-resolution survey file.
+    """
+
+    valid = (
+        (r_idx >= 0)
+        & (r_idx < r_size)
+        & (alpha_idx >= 0)
+        & (alpha_idx < angle_num)
+        & (values != 0)
+    )
+    if np.any(valid):
+        rows = r_idx[valid]
+        cols = alpha_idx[valid]
+        np.add.at(egn_mat, (rows, cols), values[valid])
+        np.add.at(egn_hit_cnt, (rows, cols), 1)
+
+
 # Generate the EGN info for a specific file
 def generate_egn_info(
     filename: str,
@@ -161,19 +188,15 @@ def generate_egn_info(
         alpha_idx = np.array(
             np.round(alpha / angle_stepsize) + angle_num / 2, dtype=int
         )
-        for ping_idx in range(2 * preproc.ping_len):
-            if (
-                0 <= r_idx[ping_idx] < r_size
-                and 0 <= alpha_idx[ping_idx] < angle_num
-                and preproc.slant_corrected_mat[vector_idx, ping_idx] != 0
-            ):
-                egn_mat[
-                    r_idx[ping_idx], alpha_idx[ping_idx]
-                ] += preproc.slant_corrected_mat[vector_idx, ping_idx]
-                egn_hit_cnt[r_idx[ping_idx], alpha_idx[ping_idx]] += 1
-
-            # else:
-            #     print(f"r_idx: {r_idx} - alpha_idx: {alpha_idx}")
+        accumulate_egn_bins(
+            egn_mat,
+            egn_hit_cnt,
+            r_idx,
+            alpha_idx,
+            preproc.slant_corrected_mat[vector_idx],
+            r_size,
+            angle_num,
+        )
     np.savez(
         out_path,
         egn_mat=egn_mat,

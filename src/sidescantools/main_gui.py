@@ -25,6 +25,7 @@ import qtpy.QtGui as QtGui
 import sys, os, pathlib
 from sidescantools.bottom_detection_napari_ui import run_napari_btm_line
 from sidescantools.georef_thread import Georeferencer
+from sidescantools.swath_geometry import GeometrySettings
 import pyqtgraph as pg
 import pyqtgraph.exporters as exporters
 import copy
@@ -834,6 +835,22 @@ class BottomLineDetectionWidget(QVBoxLayout):
             work_dir=self.main_ui.output_picker.cur_dir,
             active_dB=self.active_convert_dB_checkbox.isChecked(),
             active_hist_equal=self.active_hist_equal_checkbox.isChecked(),
+            contacts_db_path=pathlib.Path(self.main_ui.output_picker.cur_dir)
+            / "contacts.sqlite",
+            geometry_settings=GeometrySettings(
+                vertical_beam_angle=float(
+                    self.main_ui.processing_widget.vertical_beam_angle_edit.line_edit.text()
+                ),
+                cable_out_m=float(
+                    self.main_ui.view_and_export_widget.cable_out_edit.line_edit.text()
+                ),
+                x_offset_m=float(
+                    self.main_ui.view_and_export_widget.x_offset_edit.line_edit.text()
+                ),
+                y_offset_m=float(
+                    self.main_ui.view_and_export_widget.y_offset_edit.line_edit.text()
+                ),
+            ),
         )
         self.data_changed.emit()
 

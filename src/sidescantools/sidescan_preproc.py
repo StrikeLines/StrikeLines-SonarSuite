@@ -56,29 +56,39 @@ class SidescanPreprocessor:
             Factor used for decimation of ping signals
         """
         self.sidescan_file = sidescan_file
-        self.sonar_data_proc = copy.deepcopy(self.sidescan_file.data)
-        self.sonar_data_proc = np.array(self.sonar_data_proc).astype(float)
-
         self.chunk_size = chunk_size
-        self.num_chunk = int(np.ceil(self.sonar_data_proc.shape[1] / self.chunk_size))
         self.ping_len = self.sidescan_file.ping_len
         self.num_ch = num_ch
         self.downsampling_factor = downsampling_factor
+        source_data = np.asarray(self.sidescan_file.data)
+        self.num_chunk = int(np.ceil(source_data.shape[1] / self.chunk_size))
 
         # store old minimal but positive value that might be needed later if filter introduce negative values
-        self.pre_dec_least_val = np.min(
-            self.sonar_data_proc[np.where(self.sonar_data_proc > 0)]
-        )
+        self.pre_dec_least_val = np.min(source_data[np.where(source_data > 0)])
         if downsampling_factor != 1:
-            pre_dec_min = np.min(self.sonar_data_proc)
-            self.sonar_data_proc = scisig.decimate(
-                self.sonar_data_proc, downsampling_factor, axis=2
+            pre_dec_min = np.min(source_data)
+            downsampled_width = int(
+                np.ceil(self.ping_len / self.downsampling_factor)
             )
-            # Decimating filter might introduce negative values, avoid these
-            self.sonar_data_proc = np.clip(
-                self.sonar_data_proc, a_min=pre_dec_min, a_max=None
+            self.sonar_data_proc = np.empty(
+                (source_data.shape[0], source_data.shape[1], downsampled_width),
+                dtype=float,
             )
-            self.ping_len = int(np.ceil(self.ping_len / self.downsampling_factor))
+            # Filtering is independent for each ping. Work in along-track chunks
+            # to avoid a multi-gigabyte temporary float copy for large JSF files.
+            for ping_start in range(0, source_data.shape[1], self.chunk_size):
+                ping_stop = min(ping_start + self.chunk_size, source_data.shape[1])
+                decimated = scisig.decimate(
+                    np.asarray(source_data[:, ping_start:ping_stop], dtype=float),
+                    downsampling_factor,
+                    axis=2,
+                )
+                self.sonar_data_proc[:, ping_start:ping_stop] = np.clip(
+                    decimated, a_min=pre_dec_min, a_max=None
+                )
+            self.ping_len = downsampled_width
+        else:
+            self.sonar_data_proc = np.array(source_data, dtype=float, copy=True)
 
         # initialiazation of itnern variables
         self._napari_active_click_pos = False
@@ -441,6 +451,53 @@ class SidescanPreprocessor:
 
         self.bottom_map[chunk_idx] = np.hstack((port_map, star_map))
 
+    def sync_chunked_bottom_to_flat(self, chunk_idx: int | None = None):
+        """Flatten ``napari_portside_bottom``/``napari_starboard_bottom``
+        (the chunk-granularity representation written by interactive,
+        per-chunk edits) into ``portside_bottom_dist``/``starboard_bottom_dist``,
+        which ``slant_range_correction()`` actually reads. Without this, an
+        interactive edit updates the on-screen bottom map but never reaches
+        the corrected output.
+
+        Pass ``chunk_idx`` to update just that chunk's span cheaply (used
+        while dragging); omit it to rebuild the whole file (used after
+        loading a saved bottom line).
+        """
+        num_ping = self.sidescan_file.num_ping
+        if chunk_idx is None or not hasattr(self, "portside_bottom_dist"):
+            self.portside_bottom_dist = self.napari_portside_bottom.flatten()[
+                :num_ping
+            ].astype(int)
+            self.starboard_bottom_dist = self.napari_starboard_bottom.flatten()[
+                :num_ping
+            ].astype(int)
+            return
+        start = chunk_idx * self.chunk_size
+        stop = min(start + self.chunk_size, num_ping)
+        self.portside_bottom_dist[start:stop] = self.napari_portside_bottom[
+            chunk_idx, : stop - start
+        ]
+        self.starboard_bottom_dist[start:stop] = self.napari_starboard_bottom[
+            chunk_idx, : stop - start
+        ]
+
+    def sync_flat_bottom_to_chunked(self):
+        """Re-chunk ``portside_bottom_dist``/``starboard_bottom_dist``
+        (written by whole-file automatic detection: ``detect_bottom_line_t``,
+        ``refine_detected_bottom_line``) into ``napari_portside_bottom``/
+        ``napari_starboard_bottom`` and rebuild ``bottom_map``, so the
+        interactive overlay reflects a freshly (re)computed bottom line
+        instead of whatever chunk-granularity state predates it.
+        """
+        for chunk_idx in range(self.num_chunk):
+            start = chunk_idx * self.chunk_size
+            stop = start + self.chunk_size
+            port_chunk = self.portside_bottom_dist[start:stop]
+            star_chunk = self.starboard_bottom_dist[start:stop]
+            self.napari_portside_bottom[chunk_idx, : len(port_chunk)] = port_chunk
+            self.napari_starboard_bottom[chunk_idx, : len(star_chunk)] = star_chunk
+        self.build_bottom_line_map()
+
     def update_bottom_detect_plot_napari(
         self,
         image_layer,
@@ -713,7 +770,10 @@ class SidescanPreprocessor:
             alpha_idx[vector_idx] = np.array(
                 np.round(alpha / angle_stepsize) + angle_num / 2, dtype=int
             )
-            for ping_idx in range(self.ping_len):
+            # ``son_dat`` contains port and starboard side-by-side.  The old
+            # loop stopped at ``ping_len`` and therefore estimated/corrected
+            # only the port half while copying starboard back untouched.
+            for ping_idx in range(2 * self.ping_len):
                 angle_sum[alpha_idx[vector_idx, ping_idx]] += son_dat[
                     vector_idx, ping_idx
                 ]
@@ -728,7 +788,7 @@ class SidescanPreprocessor:
         angle_sum[np.where(angle_sum == 0)] = 1.0
 
         for vector_idx in range(num_ping):
-            for ping_idx in range(self.ping_len):
+            for ping_idx in range(2 * self.ping_len):
                 son_dat[vector_idx, ping_idx] /= angle_sum[
                     alpha_idx[vector_idx, ping_idx]
                 ]
@@ -1212,6 +1272,7 @@ class SidescanPreprocessor:
             son_data = self.sonar_data_proc[ch]
 
             num_ping = np.shape(slant_cor_mat)[0]
+            ping_len_local = slant_cor_mat.shape[1]
             for ping_idx in range(num_ping):
                 if ping_idx % 1000 == 0 and ping_idx != 0:
                     print(
@@ -1223,18 +1284,23 @@ class SidescanPreprocessor:
                 depth = int(self.dep_info[ch][ping_idx])  # in px
                 dd = depth**2
                 # vector to store reloacted pixels
-                ping_dat = (
-                    np.ones((slant_cor_mat.shape[1])).astype(np.float32)
-                ) * np.nan
+                ping_dat = np.full(ping_len_local, np.nan, dtype=np.float32)
 
-                for dep_idx in range(len(ping_dat)):
-                    if dep_idx > depth:
-                        if dep_idx**2 <= dd:
-                            hor_idx = dep_idx
-                        else:
-                            hor_idx = int(round(np.sqrt(dep_idx**2 - dd), 0))
-                        if hor_idx < len(ping_dat):
-                            ping_dat[hor_idx] = son_data[ping_idx, dep_idx]
+                # Vectorized flat-bottom slant-to-ground projection: for every
+                # sample beyond the nadir depth, its ground-range index is
+                # round(sqrt(dep_idx**2 - depth**2)) (Pythagoras). Computing
+                # this for the whole ping at once instead of a Python loop
+                # over every sample is what made this the dominant cost of
+                # processing a full-resolution survey file. hor_idx is built
+                # from dep_idx in increasing order, so where multiple samples
+                # project onto the same ground-range index, the assignment
+                # below keeps the same "largest dep_idx wins" result the old
+                # sequential loop produced.
+                dep_idx = np.arange(depth + 1, ping_len_local, dtype=np.int64)
+                if dep_idx.size:
+                    hor_idx = np.round(np.sqrt(dep_idx**2 - dd)).astype(np.int64)
+                    valid = hor_idx < ping_len_local
+                    ping_dat[hor_idx[valid]] = son_data[ping_idx, dep_idx[valid]]
 
                 # Process of relocating bed pixels will introduce across track gaps
                 ## in the array so we will interpolate over gaps to fill them.
@@ -1339,9 +1405,23 @@ class SidescanPreprocessor:
         angle_range = egn_info["angle_range"]
         angle_num = egn_info["angle_num"]
         angle_stepsize = egn_info["angle_stepsize"]
-        ping_len = egn_info["ping_len"]
+        table_ping_len = egn_info["ping_len"]
         r_size = egn_info["r_size"]
         r_reduc_factor = egn_info["r_reduc_factor"]
+
+        # The table may have been built at a different resolution
+        # (downsampling factor) than the data currently loaded -- e.g. a
+        # table built once from a full-resolution survey file, applied to a
+        # downsampled live view. r_idx bins are defined in build-time
+        # sample-count units, so a current-resolution range must be rescaled
+        # by this ratio before binning, or lookups (and array bounds, since
+        # everything below must be sized to self.ping_len, not the table's)
+        # silently refer to the wrong bin -- or run off the end of the
+        # current-resolution arrays entirely.
+        # alpha needs no such rescaling: it's arccos(depth / r), a ratio of
+        # two quantities computed consistently at the current resolution, so
+        # it's already resolution-independent.
+        resolution_scale = float(table_ping_len) / float(self.ping_len)
 
         # do EGN
         self.egn_corrected_mat = np.zeros(
@@ -1354,13 +1434,19 @@ class SidescanPreprocessor:
         EPS = np.finfo(float).eps
         for vector_idx in range(num_ping):
             r = np.sqrt(
-                (np.linspace(0, 2 * self.ping_len - 1, 2 * self.ping_len) - ping_len)
+                (
+                    np.linspace(0, 2 * self.ping_len - 1, 2 * self.ping_len)
+                    - self.ping_len
+                )
                 ** 2
                 + dd[vector_idx]
             )
-            r_idx = np.array(np.round(r / r_reduc_factor), dtype=int)
+            r_idx = np.array(
+                np.round((r * resolution_scale) / r_reduc_factor), dtype=int
+            )
             alpha = np.sign(
-                np.linspace(0, 2 * self.ping_len - 1, 2 * self.ping_len) - ping_len
+                np.linspace(0, 2 * self.ping_len - 1, 2 * self.ping_len)
+                - self.ping_len
             ) * np.arccos(mean_depth[vector_idx] / (r + EPS))
             alpha_idx = np.array(
                 np.round(alpha / angle_stepsize) + angle_num / 2, dtype=int
@@ -1368,15 +1454,22 @@ class SidescanPreprocessor:
 
             if vector_idx % 1000 == 0:
                 print(f"EGN Progress: {vector_idx/num_ping:.2%}")
-            for ping_idx in range(2 * ping_len):
-                if (
-                    0 <= r_idx[ping_idx] < r_size
-                    and 0 <= alpha_idx[ping_idx] < angle_num
-                ):
-                    self.egn_corrected_mat[vector_idx, ping_idx] = (
-                        self.slant_corrected_mat[vector_idx, ping_idx]
-                        / (egn_table[r_idx[ping_idx], alpha_idx[ping_idx]] + EPS)
-                    )
+
+            # Vectorized replacement for the former per-sample Python loop --
+            # a pure elementwise lookup/division (each output cell is
+            # written at most once, no duplicate-index accumulation like the
+            # EGN table build has), so plain fancy-index assignment is exact.
+            values = self.slant_corrected_mat[vector_idx]
+            valid = (
+                (r_idx >= 0)
+                & (r_idx < r_size)
+                & (alpha_idx >= 0)
+                & (alpha_idx < angle_num)
+            )
+            if np.any(valid):
+                self.egn_corrected_mat[vector_idx, valid] = values[valid] / (
+                    egn_table[r_idx[valid], alpha_idx[valid]] + EPS
+                )
 
         if save_to is not None:
             np.savez(

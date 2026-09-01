@@ -1,10 +1,12 @@
 import numpy as np
-from sidescantools.xtf_wrapper import XTFWrapper
-import pyxtf
 from sidescantools.jsf import JSFFile, JSFSystemInformation, JSFSonarDataPacket
+import logging
 import os
 from pathlib import Path
 from datetime import datetime
+
+
+logger = logging.getLogger(__name__)
 
 
 class SidescanFile:
@@ -79,6 +81,10 @@ class SidescanFile:
 
         # check whether this is XTF/JSF/not supported
         if self.filepath.suffix.casefold() == ".xtf":
+            import pyxtf
+
+            from sidescantools.xtf_wrapper import XTFWrapper
+
             xtf = XTFWrapper(file_path=self.filepath)
 
             # set data fields
@@ -197,7 +203,7 @@ class SidescanFile:
                         self.subsys_names.append(packet.header.subsys_no)
 
             if len(self.subsys_names) != self.subsys_num:
-                print(
+                logger.info(
                     f"Mismatch on subsys names: {self.subsys_names} and expected num: {self.subsys_num}"
                 )
                 self.subsys_num = len(self.subsys_names)
@@ -219,7 +225,7 @@ class SidescanFile:
                             expected_idx[packet.header.channel]
                             != packet.message.ping_no
                         ):
-                            print(
+                            logger.info(
                                 f"Expected ping mismatch: Subsys: {packet.header.subsys_no}, Channel: {packet.header.channel}, Ping number: {packet.message.ping_no} - expected ping: {expected_idx[packet.header.channel]}"
                             )
                             expected_idx[packet.header.channel] = (
@@ -294,7 +300,10 @@ class SidescanFile:
                         self.sensor_speed[p_idx] = packet.message.speed / 10 / 1.944
 
                         self.depth[p_idx] = packet.message.depth / 1e3
-                        self.packet_no[p_idx] = packet.message.packet_no
+                        # JSF ``packet_no`` counts packets within one ping and is
+                        # commonly 1 for every return. Persist the acoustic ping
+                        # number, which is stable and monotonic for contact anchors.
+                        self.packet_no[p_idx] = packet.message.ping_no
                         self.seconds_per_ping[:, p_idx] = (
                             packet.message.sampling_interval_ns / 1e9
                         )

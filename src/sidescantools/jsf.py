@@ -1,7 +1,11 @@
 from datetime import datetime
+import logging
 import struct
 import numpy as np
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
 
 
 ## header definition from JSF DATA FILE DESCRIPTION 0023492_REV_M, August 20, 2024
@@ -1610,6 +1614,7 @@ class JSFFile:
             self.file_path = path
 
         self.packets = []
+        reported_unknown_types = set()
         with open(self.file_path, "rb") as f:
 
             # read headers till EOF is reached (b'')
@@ -1823,9 +1828,11 @@ class JSFFile:
 
                         case _:
                             # Skip message bytes and report the error
-                            print(
-                                f"Message of type: {cur_header.msg_type} is unknown - {cur_header.msg_size} bytes are read without interpretation"
-                            )
+                            if cur_header.msg_type not in reported_unknown_types:
+                                logger.info(
+                                    f"Message of type: {cur_header.msg_type} is unknown - {cur_header.msg_size} bytes are read without interpretation"
+                                )
+                                reported_unknown_types.add(cur_header.msg_type)
                             message_bytes = f.read(cur_header.msg_size)
 
                             unknown_msg = JSFUnknownMessage(

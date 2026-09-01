@@ -1,17 +1,24 @@
+from __future__ import annotations
+
 import argparse
 from pathlib import Path
 import os
+from typing import TYPE_CHECKING
+
 import numpy as np
 import utm
 import math
-from sidescantools.sidescan_file import SidescanFile
 from pyproj import CRS
 from scipy.signal import savgol_filter
 from scipy import interpolate
-import pygmt
 from decimal import Decimal
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
+
+from sidescantools.swath_geometry import GeometrySettings, SwathGeometry
+
+if TYPE_CHECKING:
+    from sidescantools.sidescan_file import SidescanFile
 
 
 class Georeferencer:
@@ -57,15 +64,27 @@ class Georeferencer:
         cable_out: float = 0.0,
         x_offset: float = 0.0,
         y_offset: float = 0.0,
+        geometry_settings: GeometrySettings | None = None,
+        sidescan_file: SidescanFile | None = None,
     ):
         self.filepath = Path(filepath)
-        self.sidescan_file = SidescanFile(self.filepath)
+        if sidescan_file is None:
+            from sidescantools.sidescan_file import SidescanFile
+
+            sidescan_file = SidescanFile(self.filepath)
+        self.sidescan_file = sidescan_file
         self.channel = channel
         self.active_utm = active_utm
         self.active_export_navdata = active_export_navdata
         self.active_blockmedian = active_blockmedian
         self.output_folder = Path(output_folder)
-        self.vertical_beam_angle = vertical_beam_angle
+        self.geometry_settings = geometry_settings or GeometrySettings(
+            vertical_beam_angle=vertical_beam_angle,
+            cable_out_m=cable_out,
+            x_offset_m=x_offset,
+            y_offset_m=y_offset,
+        )
+        self.vertical_beam_angle = self.geometry_settings.vertical_beam_angle
         self.active_proc_data = False
         self.nav = nav
         self.pix_size = pix_size
@@ -78,9 +97,10 @@ class Georeferencer:
         self.HEAD_plt = np.empty_like(proc_data)
         self.LOLA_plt_ori = np.empty_like(proc_data)
         self.HEAD_plt_ori = np.empty_like(proc_data)
-        self.cable_out = cable_out
-        self.x_offset = x_offset
-        self.y_offset = y_offset
+        self.cable_out = self.geometry_settings.cable_out_m
+        self.x_offset = self.geometry_settings.x_offset_m
+        self.y_offset = self.geometry_settings.y_offset_m
+        self.swath_geometry: SwathGeometry | None = None
         if proc_data is not None:
             self.proc_data = proc_data
             self.active_proc_data = True
@@ -158,7 +178,7 @@ class Georeferencer:
                 course_ang = np.arctan2(LAT_DIFF[1], LON_DIFF[1])
                 cog[i] = course_ang
             else:
-                course_ang = np.atan2(la, lo)
+                course_ang = np.arctan2(la, lo)
                 cog[i] = course_ang
         cog[0] = cog[1]
         cog = np.unwrap(cog)
@@ -171,7 +191,7 @@ class Georeferencer:
         cog_intp = cog_spl(ping_uniform)
         self.cog_smooth = savgol_filter(cog_intp, 100, 3)
 
-    def prep_data(self):
+    def prep_data(self, *, build_bulk_nav=True):
         # Extract metadata for each ping in sonar channel
         LON_ori = self.sidescan_file.longitude
         LAT_ori = self.sidescan_file.latitude
@@ -184,7 +204,9 @@ class Georeferencer:
         else:
             swath_width = len(self.sidescan_file.data[self.channel][0])
 
-        self.PING = np.ndarray.flatten(np.array(self.PING))
+        # Always start from the source packet array so forced preparation is
+        # repeatable after a previous run filtered invalid-navigation pings.
+        source_ping = np.ndarray.flatten(np.array(self.sidescan_file.packet_no))
         LON_ori = np.ndarray.flatten(np.array(LON_ori))
         LAT_ori = np.ndarray.flatten(np.array(LAT_ori))
         HEAD_ori = np.ndarray.flatten(np.array(HEAD_ori))
@@ -205,7 +227,7 @@ class Georeferencer:
 
         GROUND_RANGE = GROUND_RANGE[ZERO_MASK]
         SLANT_RANGE = SLANT_RANGE[ZERO_MASK]
-        self.PING = self.PING[ZERO_MASK]
+        self.PING = source_ping[ZERO_MASK]
 
         # Process heading for plotting
         # Unwrap to avoid jumps when crossing 0/360° degree angle
@@ -380,17 +402,36 @@ class Georeferencer:
         self.LOLA_plt = np.column_stack((lo_intp, la_intp))
         self.LOLA_plt_ori = np.column_stack((LON_ori, LAT_ori))
 
-        # linspace for coordinates along ping
-        XX = []
-        YY = []
-        for x, y, x_out, y_out in zip(lo_intp, la_intp, lo_out_intp, la_out_intp):
-            xx = np.linspace(x, x_out, swath_width)
-            yy = np.linspace(y, y_out, swath_width)
-            XX.append(xx)
-            YY.append(yy)
-        XX = np.ndarray.flatten(np.asarray(XX))
-        YY = np.ndarray.flatten(np.asarray(YY))
-        self.nav = np.column_stack((np.ndarray.flatten(XX), np.ndarray.flatten(YY)))
+        # Keep geometry arrays aligned to original/global ping indices. GeoTIFF
+        # generation still receives only valid pings, in its legacy row order.
+        def align_to_original(values):
+            aligned = np.full(len(ZERO_MASK), np.nan, dtype=float)
+            aligned[ZERO_MASK] = values
+            return aligned
+
+        self.swath_geometry = SwathGeometry(
+            channel=self.channel,
+            sample_count=swath_width,
+            valid_ping_mask=ZERO_MASK,
+            nadir_lon=align_to_original(lo_intp),
+            nadir_lat=align_to_original(la_intp),
+            outer_lon=align_to_original(lo_out_intp),
+            outer_lat=align_to_original(la_out_intp),
+            slant_range_m=align_to_original(SLANT_RANGE),
+            ground_range_m=align_to_original(GROUND_RANGE),
+            geometry_settings=self.geometry_settings,
+        )
+        if build_bulk_nav:
+            self.nav = self.swath_geometry.coordinates_for_all_samples()
+
+    def prepare_swath_geometry(self, *, force=False, build_bulk_nav=False):
+        """Prepare reusable geometry, optionally materializing raster coordinates."""
+
+        if force or self.swath_geometry is None:
+            self.prep_data(build_bulk_nav=build_bulk_nav)
+        elif build_bulk_nav:
+            self.nav = self.swath_geometry.coordinates_for_all_samples()
+        return self.swath_geometry
 
     def channel_stack(self):
         """
@@ -461,6 +502,8 @@ class Georeferencer:
         bs_data: np.ndarray
             1D array of backscatter data (can be amplitudes or greyscales)
         """
+
+        import pygmt
 
         # Determine pixel size based on minimum distance between coordinates
         self.get_pix_size(self.nav[:, 0], self.nav[:, 1], res_factor=1)
@@ -562,7 +605,7 @@ class Georeferencer:
     def process(self, progress_signal=None):
         # Check if enough data are present, otherwise quit
         if len(self.PING) > 300:
-            self.prep_data()
+            self.prepare_swath_geometry(force=True, build_bulk_nav=True)
             chan_stack_flat = self.channel_stack()
 
             try:

@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_tmp*/
+.venv/
+*.egg-info/
+
+# Local sonar surveys and generated processing/project data
+*.jsf
+*.xtf
+*_bottom_info.npz
+egn_table_*.npz
+*.sqlite
