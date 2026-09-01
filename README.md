@@ -50,6 +50,14 @@
   coordinates and processing results back to the existing georeferencing
   pipeline.
 
+## Qt contact-picker workspace
+
+![SidescanTools Qt contact picker showing the continuous sonar waterfall, bottom-line controls, TVG controls, and saved contacts](docs/images/qt-contact-picker.jpg)
+
+*The classic Qt workspace with the editable bottom-line panel, continuous
+port/starboard waterfall, gain and TVG controls, and persistent sonar contact
+list.*
+
 SidescanTools is an open-source software to read and <br />
 <img align="right" width="250" height="250" src="./src/sidescantools/res/sidescantools_logo_rund.png" hspace="25" title="Logo design and artwork by Aili Xue">
 process data from side-scan sonar instruments. <br />
