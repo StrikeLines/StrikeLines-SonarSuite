@@ -18,22 +18,27 @@
   layback/cable-out, and sensor offsets. Stale coordinates can be recomputed
   after geometry settings change, and valid WGS 84 contacts can be exported as
   GPX waypoints.
-- **Fine-grained display gain and TVG.** The Qt waterfall exposes overall gain,
-  logarithmic spreading compensation, linear absorption compensation, and
-  along-track display scale. 
-- **New bottom-line workflow.** View and edit the bottom line directly
-  over the continuous waterfall. Automatic bottom line detection. Manually trace bottom line to edit.
-  Changes auto-save beside the sonar file as
-  `<name>_bottom_info.npz`.
+- **Fine-grained display gain and TVG.** The Qt waterfall's Processing and Gain
+  sidebar exposes overall gain, logarithmic spreading compensation, and linear
+  absorption compensation with large step buttons. The **Auto TVG** action
+  equalizes typical brightness across port and starboard, raises dark regions,
+  reduces blown-out regions, and uses a user-selectable brightness target
+  (30% by default) with an overall gain baseline of approximately -10 dB.
+- **Focused processing controls.** Switch the display between the raw waterfall
+  and Empirical Gain Normalization (EGN) data. The Qt workflow also includes EGN
+  table selection and a multi-file EGN table builder.
+- **New bottom-line workflow.** View and edit the bottom line directly over the
+  continuous waterfall. Automatic bottom-line detection and manual tracing are
+  available. Changes auto-save beside the sonar file as `<name>_bottom_info.npz`.
 - **Work in multiple sonar files.** Open files directly or move to the previous
   and next JSF/XTF file in a folder while retaining the contact database and
-  session display settings. 
+  session display settings.
 
 ## Qt contact-picker workspace
 
 ![SidescanTools Qt contact picker showing the continuous sonar waterfall, bottom-line controls, TVG controls, and saved contacts](docs/images/qt-contact-picker.jpg)
 
-*The classic Qt workspace with the editable bottom-line panel, continuous
+*The Qt workspace with the editable bottom-line panel, continuous
 port/starboard waterfall, gain and TVG controls, and persistent sonar contact
 list.*
 
@@ -76,16 +81,20 @@ Or open a JSF/XTF file directly:
 sidescantools-contacts "C:\path\to\survey.jsf" --viewer qt
 ```
 
-The classic Qt layout is the default. To try the redesigned preview:
-
-```powershell
-sidescantools-contacts "C:\path\to\survey.jsf" --viewer qt --ui v2
-```
-
 Useful optional arguments include `--contacts-db` for a specific SQLite
 project, `--work-dir` for outputs, and geometry controls such as `--cable-out`,
 `--x-offset`, and `--y-offset`. Run `sidescantools-contacts --help` for the full
 list. On Windows, `--viewer auto` also selects the Qt viewer automatically.
+
+### Per-file TVG and processing settings
+
+The Qt picker automatically writes a versioned JSON sidecar named
+`<sonar_filename>.tvg_gain.cfg` beside every opened JSF/XTF file. It restores
+that file's overall gain, TVG spreading and absorption, Auto TVG target and
+fitted correction, Speed Correction, Raw/EGN mode, and EGN table path the next
+time the sonar file is opened. The format is implemented independently of Qt
+in `sidescantools.gain_settings` so batch GeoTIFF and mosaicking workflows can
+load the same settings directly.
 
 ## Start the original workflows
 

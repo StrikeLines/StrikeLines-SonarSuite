@@ -6,15 +6,26 @@ import numpy as np
 import pytest
 from qtpy.QtCore import QEvent, QObject, QPoint, QRunnable, Qt, QTimer, Signal
 from qtpy.QtWidgets import (
+    QComboBox,
     QGraphicsItem,
     QGraphicsView,
+    QGroupBox,
     QLabel,
+    QLineEdit,
+    QMainWindow,
     QPushButton,
+    QToolButton,
     QWidget,
 )
 
 from sidescantools import qt_contact_picker_ui
+from sidescantools.contact_gain import BuiltInGainMode
 from sidescantools.contact_store import ContactStore
+from sidescantools.gain_settings import (
+    SonarGainSettings,
+    load_gain_settings,
+    save_gain_settings,
+)
 from sidescantools.interaction_mode import InteractionModeController
 from sidescantools.qt_contact_picker_ui import (
     EGNTableBuildCoordinator,
@@ -73,7 +84,302 @@ def test_requested_gain_and_scale_defaults_are_applied(qtbot):
     assert model.overall_gain_db == -5.0
     assert model.tvg_spreading_db_per_decade == 5.0
     assert model.tvg_absorption_db_per_m == 0.08
+    assert model.MAX_OVERALL_GAIN_DB == 20
+    assert model.MAX_TVG_SPREADING_DB_PER_DECADE == 34
+    assert model.MAX_TVG_ABSORPTION_DB_PER_M == 0.2
+    assert model.normalize_target_percent == 30
     assert view._along_track_scale == 3.0
+
+
+def test_processing_panel_starts_with_gain_and_view_controls(qtbot, tmp_path):
+    window = QMainWindow()
+    qtbot.addWidget(window)
+    window.filepath = tmp_path / "line.jsf"
+    window.gain_slider, window.gain_spin = QtContactPickerWindow._gain_control(
+        WaterfallGainModel.MIN_OVERALL_GAIN_DB,
+        WaterfallGainModel.MAX_OVERALL_GAIN_DB,
+        WaterfallGainModel.DEFAULT_OVERALL_GAIN_DB,
+    )
+    window.tvg_spreading_slider, window.tvg_spreading_spin = (
+        QtContactPickerWindow._gain_control(
+            WaterfallGainModel.MIN_TVG_SPREADING_DB_PER_DECADE,
+            WaterfallGainModel.MAX_TVG_SPREADING_DB_PER_DECADE,
+            WaterfallGainModel.DEFAULT_TVG_SPREADING_DB_PER_DECADE,
+        )
+    )
+    window.tvg_absorption_slider, window.tvg_absorption_spin = (
+        QtContactPickerWindow._fine_control(
+            WaterfallGainModel.MIN_TVG_ABSORPTION_DB_PER_M,
+            WaterfallGainModel.MAX_TVG_ABSORPTION_DB_PER_M,
+            WaterfallGainModel.DEFAULT_TVG_ABSORPTION_DB_PER_M,
+            step=0.01,
+            decimals=2,
+            suffix=" dB/m",
+        )
+    )
+    window.along_track_slider, window.along_track_spin = (
+        QtContactPickerWindow._along_track_control(
+            0.1, 8.0, WaterfallView.DEFAULT_ALONG_TRACK_SCALE
+        )
+    )
+    window.normalize_tvg_button = QPushButton("Auto TVG")
+    window.normalize_target_button = QPushButton(
+        "Auto TVG Brightness Target: 30%…"
+    )
+    window.reset_gain_button = QPushButton("Reset TVG")
+    window.reset_view_button = QPushButton("Reset view")
+    window._sidebar_gain_control = QtContactPickerWindow._sidebar_gain_control
+    window._emphasize_sidebar_group = QtContactPickerWindow._emphasize_sidebar_group
+    window._processing_mode_changed = (
+        QtContactPickerWindow._processing_mode_changed.__get__(window)
+    )
+    window.browse_egn_table = lambda: None
+    window.open_egn_table_builder = lambda: None
+    window.apply_builtin_processing = lambda: None
+    window.show_raw_waterfall = lambda: None
+
+    panel = QtContactPickerWindow._build_processing_panel(window)
+    qtbot.addWidget(panel)
+
+    groups = panel.findChildren(
+        QGroupBox, options=Qt.FindChildOption.FindDirectChildrenOnly
+    )
+    assert [group.title() for group in groups[:3]] == [
+        "Gain & TVG",
+        "View",
+        "EGN Settings & Options",
+    ]
+    assert all("border: 2px solid" in group.styleSheet() for group in groups[:3])
+    assert window.gain_slider.maximum() == 20
+    assert window.tvg_spreading_slider.maximum() == 34
+    assert window.tvg_absorption_slider.maximum() == 20  # fixed-point 0.20
+    assert window.along_track_slider in groups[1].findChildren(
+        type(window.along_track_slider)
+    )
+    assert "Speed Correction" in " ".join(
+        label.text() for label in groups[1].findChildren(QLabel)
+    )
+    assert [
+        button.text()
+        for button in groups[0].findChildren(QPushButton)
+    ] == [
+        "Auto TVG",
+        "Auto TVG Brightness Target: 30%…",
+        "Reset TVG",
+    ]
+    assert all(button.width() >= 36 for button in groups[0].findChildren(QToolButton))
+    assert [
+        window.processing_mode.itemData(index)
+        for index in range(window.processing_mode.count())
+    ] == ["raw", "egn"]
+    visible_text = " ".join(label.text() for label in panel.findChildren(QLabel))
+    for removed_text in (
+        "CLAHE",
+        "processed intensity",
+        "logged sensor",
+        "Nadir",
+        "BAC",
+    ):
+        assert removed_text not in visible_text
+
+
+def test_egn_table_nadir_angle_uses_saved_metadata(tmp_path):
+    table_path = tmp_path / "table.npz"
+    np.savez(table_path, nadir_angle=np.array(7.5))
+
+    assert qt_contact_picker_ui.egn_table_nadir_angle(table_path) == 7.5
+    assert (
+        qt_contact_picker_ui.egn_table_nadir_angle(tmp_path / "missing.npz") == 0.0
+    )
+
+
+class _GainSettingsWindow(QMainWindow):
+    _connect_gain_settings_autosave = (
+        QtContactPickerWindow._connect_gain_settings_autosave
+    )
+    _schedule_gain_settings_save = QtContactPickerWindow._schedule_gain_settings_save
+    _current_file_gain_settings = QtContactPickerWindow._current_file_gain_settings
+    _save_file_gain_settings = QtContactPickerWindow._save_file_gain_settings
+    _flush_pending_gain_settings_save = (
+        QtContactPickerWindow._flush_pending_gain_settings_save
+    )
+    _reset_file_gain_settings = QtContactPickerWindow._reset_file_gain_settings
+    _apply_file_gain_settings = QtContactPickerWindow._apply_file_gain_settings
+    _restore_file_gain_settings = QtContactPickerWindow._restore_file_gain_settings
+
+    def __init__(self, filepath):
+        super().__init__()
+        self.filepath = filepath
+        self.display = WaterfallGainModel(np.full((4, 8), 0.2), slant_range_m=20.0)
+        self.gain_slider, self.gain_spin = QtContactPickerWindow._gain_control(
+            WaterfallGainModel.MIN_OVERALL_GAIN_DB,
+            WaterfallGainModel.MAX_OVERALL_GAIN_DB,
+            WaterfallGainModel.DEFAULT_OVERALL_GAIN_DB,
+        )
+        self.tvg_spreading_slider, self.tvg_spreading_spin = (
+            QtContactPickerWindow._gain_control(
+                WaterfallGainModel.MIN_TVG_SPREADING_DB_PER_DECADE,
+                WaterfallGainModel.MAX_TVG_SPREADING_DB_PER_DECADE,
+                WaterfallGainModel.DEFAULT_TVG_SPREADING_DB_PER_DECADE,
+            )
+        )
+        self.tvg_absorption_slider, self.tvg_absorption_spin = (
+            QtContactPickerWindow._fine_control(
+                WaterfallGainModel.MIN_TVG_ABSORPTION_DB_PER_M,
+                WaterfallGainModel.MAX_TVG_ABSORPTION_DB_PER_M,
+                WaterfallGainModel.DEFAULT_TVG_ABSORPTION_DB_PER_M,
+                step=0.01,
+                decimals=2,
+                suffix=" dB/m",
+            )
+        )
+        self.along_track_slider, self.along_track_spin = (
+            QtContactPickerWindow._along_track_control(
+                0.1, 8.0, WaterfallView.DEFAULT_ALONG_TRACK_SCALE
+            )
+        )
+        self.gain_spin.valueChanged.connect(
+            lambda value: setattr(self.display, "overall_gain_db", float(value))
+        )
+        self.tvg_spreading_spin.valueChanged.connect(
+            lambda value: setattr(
+                self.display, "tvg_spreading_db_per_decade", float(value)
+            )
+        )
+        self.tvg_absorption_spin.valueChanged.connect(
+            lambda value: setattr(
+                self.display, "tvg_absorption_db_per_m", float(value)
+            )
+        )
+        self.normalize_target_button = QPushButton()
+        self.processing_mode = QComboBox()
+        self.processing_mode.addItem("Raw waterfall", BuiltInGainMode.RAW.value)
+        self.processing_mode.addItem("EGN", BuiltInGainMode.EGN.value)
+        self.egn_path = QLineEdit()
+        self._restoring_gain_settings = False
+        self._pending_restored_gain_settings = None
+        self.gain_settings_save_timer = QTimer(self)
+        self.gain_settings_save_timer.setSingleShot(True)
+        self.gain_settings_save_timer.setInterval(50)
+        self.gain_settings_save_timer.timeout.connect(self._save_file_gain_settings)
+        self.applied_processing = 0
+        self._connect_gain_settings_autosave()
+
+    def apply_builtin_processing(self):
+        self.applied_processing += 1
+
+
+def test_gain_settings_autosave_debounces_and_writes_next_to_sonar(qtbot, tmp_path):
+    sonar_path = tmp_path / "line.jsf"
+    window = _GainSettingsWindow(sonar_path)
+    qtbot.addWidget(window)
+
+    window.gain_spin.setValue(4.0)
+    window.tvg_spreading_spin.setValue(22.0)
+    window.tvg_absorption_spin.setValue(0.15)
+    window.along_track_spin.setValue(2.5)
+
+    with qtbot.waitSignal(window.gain_settings_save_timer.timeout, timeout=1000):
+        pass
+
+    saved = load_gain_settings(sonar_path)
+    assert saved is not None
+    assert saved.overall_gain_db == 4.0
+    assert saved.tvg_spreading_db_per_decade == 22.0
+    assert saved.tvg_absorption_db_per_m == 0.15
+    assert saved.speed_correction_px_per_ping == 2.5
+
+
+def test_opening_a_sonar_file_creates_default_gain_settings(qtbot, tmp_path):
+    sonar_path = tmp_path / "new-line.jsf"
+    window = _GainSettingsWindow(sonar_path)
+    qtbot.addWidget(window)
+
+    notice = window._restore_file_gain_settings()
+
+    assert notice is None
+    saved = load_gain_settings(sonar_path)
+    assert saved is not None
+    assert saved.source_file == sonar_path.name
+    assert saved.processing_mode == "raw"
+    assert saved.auto_tvg_brightness_target_percent == 30
+
+
+def test_pending_gain_settings_are_flushed_immediately(qtbot, tmp_path):
+    sonar_path = tmp_path / "line.jsf"
+    window = _GainSettingsWindow(sonar_path)
+    qtbot.addWidget(window)
+    window.gain_spin.setValue(6.0)
+    assert window.gain_settings_save_timer.isActive()
+
+    window._flush_pending_gain_settings_save()
+
+    assert not window.gain_settings_save_timer.isActive()
+    assert load_gain_settings(sonar_path).overall_gain_db == 6.0
+
+
+def test_gain_settings_restore_the_exact_auto_tvg_curve(qtbot, tmp_path):
+    sonar_path = tmp_path / "line.xtf"
+    correction = tuple(np.linspace(-2.0, 2.0, 8))
+    save_gain_settings(
+        sonar_path,
+        SonarGainSettings(
+            source_file=sonar_path.name,
+            overall_gain_db=-8.0,
+            tvg_spreading_db_per_decade=24.0,
+            tvg_absorption_db_per_m=0.17,
+            auto_tvg_brightness_target_percent=38,
+            auto_tvg_active=True,
+            auto_tvg_gain_db=correction,
+            speed_correction_px_per_ping=4.25,
+            processing_mode="raw",
+            egn_table_path=None,
+        ),
+    )
+    window = _GainSettingsWindow(sonar_path)
+    qtbot.addWidget(window)
+
+    notice = window._restore_file_gain_settings()
+
+    assert notice is None
+    assert window.display.overall_gain_db == -8.0
+    assert window.display.tvg_spreading_db_per_decade == 24.0
+    assert window.display.tvg_absorption_db_per_m == 0.17
+    assert window.display.normalize_target_percent == 38
+    assert window.display.auto_tvg_active is True
+    assert window.display.auto_tvg_gain_db == pytest.approx(correction)
+    assert window.along_track_spin.value() == 4.25
+    assert "38%" in window.normalize_target_button.text()
+
+
+def test_egn_gain_settings_restore_path_and_schedule_processing(qtbot, tmp_path):
+    sonar_path = tmp_path / "line.jsf"
+    table_path = tmp_path / "tables" / "egn.npz"
+    save_gain_settings(
+        sonar_path,
+        SonarGainSettings(
+            source_file=sonar_path.name,
+            overall_gain_db=-5.0,
+            tvg_spreading_db_per_decade=5.0,
+            tvg_absorption_db_per_m=0.08,
+            auto_tvg_brightness_target_percent=30,
+            auto_tvg_active=False,
+            auto_tvg_gain_db=(),
+            speed_correction_px_per_ping=3.0,
+            processing_mode="egn",
+            egn_table_path="tables/egn.npz",
+        ),
+    )
+    window = _GainSettingsWindow(sonar_path)
+    qtbot.addWidget(window)
+
+    notice = window._restore_file_gain_settings()
+    qtbot.waitUntil(lambda: window.applied_processing == 1, timeout=1000)
+
+    assert notice is None
+    assert window.processing_mode.currentData() == "egn"
+    assert Path(window.egn_path.text()) == table_path
+    assert window._pending_restored_gain_settings is not None
 
 
 def test_tvg_spreading_profile_is_symmetric_and_strongest_at_outer_ranges():
@@ -189,8 +495,40 @@ def test_normalize_tvg_recovers_known_range_attenuation_and_flattens_brightness(
     assert overall == -10.0
     assert spreading == pytest.approx(18.0, abs=0.25)
     assert absorption == pytest.approx(0.12, abs=0.005)
-    assert np.median(corrected) == pytest.approx(0.5, abs=0.02)
+    assert np.median(corrected) == pytest.approx(0.30, abs=0.02)
     assert np.ptp(np.median(corrected, axis=0)) < 0.06
+
+
+def test_normalize_tvg_uses_a_user_selected_brightness_target():
+    model = WaterfallGainModel(np.full((20, 40), 0.2), slant_range_m=30.0)
+
+    model.set_normalize_target_percent(42)
+    model.normalize_tvg()
+
+    assert np.median(model.corrected()) == pytest.approx(0.42, abs=0.02)
+    assert "swath-equalized=42pct" in model.pipeline_description
+    with pytest.raises(ValueError, match="between 1% and 100%"):
+        model.set_normalize_target_percent(0)
+
+
+def test_normalize_target_button_updates_and_applies_the_target(qtbot, monkeypatch):
+    window = QMainWindow()
+    qtbot.addWidget(window)
+    window.display = WaterfallGainModel(np.full((2, 6), 0.1))
+    window.normalize_target_button = QPushButton()
+    applied = []
+    window.normalize_tvg = lambda: applied.append(True)
+    monkeypatch.setattr(
+        qt_contact_picker_ui.QInputDialog,
+        "getInt",
+        staticmethod(lambda *args: (42, True)),
+    )
+
+    QtContactPickerWindow.set_normalize_target(window)
+
+    assert window.display.normalize_target_percent == 42
+    assert window.normalize_target_button.text() == "Auto TVG Brightness Target: 42%…"
+    assert applied == [True]
 
 
 def test_normalize_tvg_is_robust_to_bad_values_and_local_bright_targets():
@@ -246,10 +584,10 @@ def test_normalize_tvg_raises_dark_areas_and_reduces_blown_out_areas():
     assert after[dark_column] > before[dark_column]
     assert after[bright_column] < before[bright_column]
     assert np.std(after) < np.std(before) * 0.2
-    assert np.percentile(after, 5) > 0.43
-    assert np.percentile(after, 95) < 0.57
+    assert np.percentile(after, 5) > 0.25
+    assert np.percentile(after, 95) < 0.35
     assert model.overall_gain_db == WaterfallGainModel.NORMALIZE_OVERALL_GAIN_DB
-    assert "swath-equalized=50pct" in model.pipeline_description
+    assert "swath-equalized=30pct" in model.pipeline_description
 
 
 def test_clear_normalization_removes_the_empirical_gain_curve():

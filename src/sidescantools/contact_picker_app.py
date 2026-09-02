@@ -47,15 +47,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="display backend; auto uses the OpenGL-free Qt viewer on Windows",
     )
-    parser.add_argument(
-        "--ui",
-        choices=("classic", "v2"),
-        default="classic",
-        help="Qt window design (only applies with --viewer qt): 'classic' is "
-        "the current shipped layout, 'v2' is a redesigned-layout preview. "
-        "Both share the same file loading, gain model, and contacts "
-        "database, so switching does not affect saved data.",
-    )
     return parser
 
 
@@ -113,12 +104,7 @@ def main(argv: list[str] | None = None) -> None:
         geometry_settings=settings,
     )
     if viewer_backend == "qt":
-        if arguments.ui == "v2":
-            from sidescantools.qt_contact_picker_ui_v2 import (
-                run_qt_contact_picker_v2 as run_qt_contact_picker,
-            )
-        else:
-            from sidescantools.qt_contact_picker_ui import run_qt_contact_picker
+        from sidescantools.qt_contact_picker_ui import run_qt_contact_picker
 
         run_qt_contact_picker(sonar_file, **common_arguments)
         return

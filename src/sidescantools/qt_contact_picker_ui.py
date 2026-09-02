@@ -15,6 +15,7 @@ import numpy as np
 from qtpy.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from qtpy.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QBrush, QTransform
 from qtpy.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -26,7 +27,9 @@ from qtpy.QtWidgets import (
     QGraphicsItem,
     QGraphicsScene,
     QGraphicsView,
+    QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -36,6 +39,7 @@ from qtpy.QtWidgets import (
     QPushButton,
     QSlider,
     QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -56,6 +60,14 @@ from sidescantools.contact_thumbnail import ContactThumbnailExtractor
 from sidescantools.contact_ui import ContactDock
 from sidescantools.custom_threading import EGNTableProcessingWorker
 from sidescantools.egn_table_build import generate_egn_table_from_infos
+from sidescantools.gain_settings import (
+    SonarGainSettings,
+    gain_settings_path,
+    load_gain_settings,
+    portable_egn_table_path,
+    resolve_egn_table_path,
+    save_gain_settings,
+)
 from sidescantools.georef_thread import Georeferencer
 from sidescantools.interaction_mode import InteractionMode, InteractionModeController
 from sidescantools.sidescan_file import SidescanFile
@@ -548,6 +560,20 @@ def sonar_files_in_directory(directory: str | os.PathLike) -> list[Path]:
     )
 
 
+def egn_table_nadir_angle(table_path: Path | None) -> float:
+    """Read the EGN table's nadir angle without another UI setting."""
+
+    if table_path is None:
+        return 0.0
+    try:
+        with np.load(table_path) as table:
+            return float(table["nadir_angle"]) if "nadir_angle" in table else 0.0
+    except Exception:
+        # The processing worker validates the selected table and reports a
+        # useful error. A missing optional angle should retain the old default.
+        return 0.0
+
+
 @dataclass
 class SonarLoaderSettings:
     """Session-level settings that stay fixed while navigating between files
@@ -742,16 +768,18 @@ class WaterfallGainModel:
     _TVG_FLOOR_FRACTION = 0.02
     DEFAULT_OVERALL_GAIN_DB = -5.0
     MIN_OVERALL_GAIN_DB = -30
-    MAX_OVERALL_GAIN_DB = 40
+    MAX_OVERALL_GAIN_DB = 20
     DEFAULT_TVG_SPREADING_DB_PER_DECADE = 5.0
     DEFAULT_TVG_ABSORPTION_DB_PER_M = 0.08
     MIN_TVG_SPREADING_DB_PER_DECADE = -20
-    MAX_TVG_SPREADING_DB_PER_DECADE = 60
+    MAX_TVG_SPREADING_DB_PER_DECADE = 34
     MIN_TVG_ABSORPTION_DB_PER_M = 0.0
-    MAX_TVG_ABSORPTION_DB_PER_M = 2.0
+    MAX_TVG_ABSORPTION_DB_PER_M = 0.2
     _NORMALIZE_MAX_SAMPLED_VALUES = 4_000_000
     _NORMALIZE_RANGE_BINS = 128
-    NORMALIZE_TARGET_AMPLITUDE = 0.5
+    DEFAULT_NORMALIZE_TARGET_PERCENT = 30
+    MIN_NORMALIZE_TARGET_PERCENT = 1
+    MAX_NORMALIZE_TARGET_PERCENT = 100
     NORMALIZE_OVERALL_GAIN_DB = -10.0
     _NORMALIZE_MIN_TOTAL_GAIN_DB = -30.0
     _NORMALIZE_MAX_TOTAL_GAIN_DB = 60.0
@@ -768,6 +796,7 @@ class WaterfallGainModel:
             self.DEFAULT_TVG_SPREADING_DB_PER_DECADE
         )
         self.tvg_absorption_db_per_m = self.DEFAULT_TVG_ABSORPTION_DB_PER_M
+        self.normalize_target_percent = self.DEFAULT_NORMALIZE_TARGET_PERCENT
         # A single representative max range for the whole waterfall, not a
         # per-ping value -- deliberately simple, matching how a processor
         # tunes TVG by eye rather than from a precise per-ping model. Falls
@@ -827,7 +856,7 @@ class WaterfallGainModel:
             f"|tvg-absorption={self.tvg_absorption_db_per_m:.2f}dB/m"
         )
         if self._normalization_active:
-            description += "|swath-equalized=50pct"
+            description += f"|swath-equalized={self.normalize_target_percent}pct"
         return description
 
     def gain_profile(self) -> np.ndarray:
@@ -848,8 +877,41 @@ class WaterfallGainModel:
         self._normalization_gain_db = np.zeros(self.source.shape[1], dtype=float)
         self._normalization_active = False
 
+    @property
+    def auto_tvg_active(self) -> bool:
+        return self._normalization_active
+
+    @property
+    def auto_tvg_gain_db(self) -> tuple[float, ...]:
+        if not self._normalization_active:
+            return ()
+        return tuple(float(value) for value in self._normalization_gain_db)
+
+    def restore_auto_tvg_gain(self, gain_db: tuple[float, ...]) -> None:
+        values = np.asarray(gain_db, dtype=float)
+        if values.shape != (self.source.shape[1],):
+            raise ValueError(
+                "saved Auto TVG correction does not match the waterfall width"
+            )
+        if not np.all(np.isfinite(values)):
+            raise ValueError("saved Auto TVG correction contains invalid values")
+        self._normalization_gain_db = values.copy()
+        self._normalization_active = True
+
+    def set_normalize_target_percent(self, target_percent: int) -> None:
+        target_percent = int(target_percent)
+        if not (
+            self.MIN_NORMALIZE_TARGET_PERCENT
+            <= target_percent
+            <= self.MAX_NORMALIZE_TARGET_PERCENT
+        ):
+            raise ValueError("normalize target brightness must be between 1% and 100%")
+        if target_percent != self.normalize_target_percent:
+            self.clear_normalization()
+        self.normalize_target_percent = target_percent
+
     def normalize_tvg(self) -> tuple[float, float, float]:
-        """Equalize typical brightness across the swath around 50% gray.
+        """Equalize typical brightness across the swath around the selected target.
 
         Broad loss is exposed through the normal overall/spreading/absorption
         controls. A smooth per-column residual handles port/starboard
@@ -944,7 +1006,8 @@ class WaterfallGainModel:
             cutoff = 1.5 * robust_scale
             weights = np.minimum(1.0, cutoff / np.maximum(np.abs(residual), 1e-12))
 
-        target_db = 20.0 * math.log10(self.NORMALIZE_TARGET_AMPLITUDE)
+        target_amplitude = self.normalize_target_percent / 100.0
+        target_db = 20.0 * math.log10(target_amplitude)
         # Match the precision the UI can actually retain; the empirical
         # residual below is calculated after rounding, so setting the visible
         # controls cannot subtly undo the equalization.
@@ -1360,6 +1423,12 @@ class QtContactPickerWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self.processing_worker = None
         self.bottom_worker = None
+        self._restoring_gain_settings = False
+        self._pending_restored_gain_settings = None
+        self.gain_settings_save_timer = QTimer(self)
+        self.gain_settings_save_timer.setSingleShot(True)
+        self.gain_settings_save_timer.setInterval(500)
+        self.gain_settings_save_timer.timeout.connect(self._save_file_gain_settings)
         self.interaction_modes = InteractionModeController()
         self.interaction_modes.add_listener(self._apply_interaction_mode)
         self.setWindowTitle("SidescanTools - Contact picker (Qt raster)")
@@ -1415,15 +1484,28 @@ class QtContactPickerWindow(QMainWindow):
         self.render_timer.setSingleShot(True)
         self.render_timer.setInterval(90)
         self.render_timer.timeout.connect(self.render_gain)
-        reset_gain_button = QPushButton("Reset gain")
-        reset_gain_button.clicked.connect(self.reset_gain)
-        normalize_tvg_button = QPushButton("Normalize")
-        normalize_tvg_button.setToolTip(
-            "Equalize typical brightness across the full swath around 50%. "
+        self.reset_gain_button = QPushButton("Reset TVG")
+        self.reset_gain_button.setMinimumHeight(36)
+        self.reset_gain_button.clicked.connect(self.reset_gain)
+        self.normalize_tvg_button = QPushButton("Auto TVG")
+        self.normalize_tvg_button.setMinimumHeight(36)
+        self.normalize_tvg_button.setToolTip(
+            "Equalize typical brightness across the full swath around the "
+            "selected target. "
             "Automatically adjusts overall gain and TVG, then applies a "
             "smooth residual correction to dark and blown-out areas."
         )
-        normalize_tvg_button.clicked.connect(self.normalize_tvg)
+        self.normalize_tvg_button.clicked.connect(self.normalize_tvg)
+        self.normalize_target_button = QPushButton(
+            "Auto TVG Brightness Target: "
+            f"{self.display.normalize_target_percent}%…"
+        )
+        self.normalize_target_button.setMinimumHeight(36)
+        self.normalize_target_button.setToolTip(
+            "Choose the desired typical waterfall brightness, then normalize "
+            "the current swath to that target."
+        )
+        self.normalize_target_button.clicked.connect(self.set_normalize_target)
 
         self.along_track_slider, self.along_track_spin = self._along_track_control(
             0.1, 8.0, WaterfallView.DEFAULT_ALONG_TRACK_SCALE
@@ -1439,33 +1521,14 @@ class QtContactPickerWindow(QMainWindow):
         # here is enough to apply every change live -- this is a cheap view
         # transform, not a re-render, so no debounce timer is needed.
         self.along_track_spin.valueChanged.connect(self.view.set_along_track_scale)
-        reset_view_button = QPushButton("Reset view")
-        reset_view_button.clicked.connect(self.reset_view)
-
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Overall gain"))
-        controls.addWidget(self.gain_slider, 1)
-        controls.addWidget(self.gain_spin)
-        controls.addSpacing(14)
-        controls.addWidget(QLabel("TVG spreading"))
-        controls.addWidget(self.tvg_spreading_slider, 1)
-        controls.addWidget(self.tvg_spreading_spin)
-        controls.addSpacing(14)
-        controls.addWidget(QLabel("TVG absorption"))
-        controls.addWidget(self.tvg_absorption_slider, 1)
-        controls.addWidget(self.tvg_absorption_spin)
-        controls.addWidget(normalize_tvg_button)
-        controls.addWidget(reset_gain_button)
-        controls.addSpacing(14)
-        controls.addWidget(QLabel("Along-track scale"))
-        controls.addWidget(self.along_track_slider, 1)
-        controls.addWidget(self.along_track_spin)
-        controls.addWidget(reset_view_button)
+        self.reset_view_button = QPushButton("Reset view")
+        self.reset_view_button.setMinimumHeight(36)
+        self.reset_view_button.clicked.connect(self.reset_view)
 
         instructions = QLabel(
             "Left-click a sonar return to save a contact. Drag to pan; scroll "
             "the wheel to move up/down the survey. Width always fits the "
-            "window -- use \"Along-track scale\" to fix contact shapes "
+            "window -- use \"Speed Correction\" to fix contact shapes "
             "distorted by vessel-speed changes."
         )
 
@@ -1492,7 +1555,6 @@ class QtContactPickerWindow(QMainWindow):
         layout = QVBoxLayout(central)
         layout.addLayout(file_nav)
         layout.addWidget(instructions)
-        layout.addLayout(controls)
         layout.addWidget(self.view, 1)
         self.setCentralWidget(central)
 
@@ -1547,6 +1609,8 @@ class QtContactPickerWindow(QMainWindow):
         bottom_line_dock.setWidget(self._build_bottom_line_panel())
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, bottom_line_dock)
         self.tabifyDockWidget(processing_dock, bottom_line_dock)
+        self._connect_gain_settings_autosave()
+        gain_settings_notice = self._restore_file_gain_settings()
         self.contact_dock.contact_deleted.connect(self.refresh_chunk)
         self.contact_dock.contact_updated.connect(self.refresh_chunk)
         self.contact_dock.table.selectionModel().selectionChanged.connect(
@@ -1559,6 +1623,8 @@ class QtContactPickerWindow(QMainWindow):
         self._update_file_position()
         self._update_database_label()
         self._update_status()
+        if gain_settings_notice:
+            self.statusBar().showMessage(gain_settings_notice, 8000)
 
     @staticmethod
     def _gain_control(minimum: int, maximum: int, value: float):
@@ -1613,6 +1679,152 @@ class QtContactPickerWindow(QMainWindow):
     def reset_view(self) -> None:
         self.along_track_spin.setValue(WaterfallView.DEFAULT_ALONG_TRACK_SCALE)
         self.view.verticalScrollBar().setValue(0)
+
+    def _connect_gain_settings_autosave(self) -> None:
+        for spin in (
+            self.gain_spin,
+            self.tvg_spreading_spin,
+            self.tvg_absorption_spin,
+            self.along_track_spin,
+        ):
+            spin.valueChanged.connect(self._schedule_gain_settings_save)
+        self.processing_mode.currentIndexChanged.connect(
+            self._schedule_gain_settings_save
+        )
+        self.egn_path.textChanged.connect(self._schedule_gain_settings_save)
+
+    def _schedule_gain_settings_save(self, *args) -> None:
+        if not self._restoring_gain_settings:
+            self.gain_settings_save_timer.start()
+
+    def _current_file_gain_settings(self) -> SonarGainSettings:
+        egn_path = self.egn_path.text().strip()
+        return SonarGainSettings(
+            source_file=self.filepath.name,
+            overall_gain_db=self.display.overall_gain_db,
+            tvg_spreading_db_per_decade=(
+                self.display.tvg_spreading_db_per_decade
+            ),
+            tvg_absorption_db_per_m=self.display.tvg_absorption_db_per_m,
+            auto_tvg_brightness_target_percent=(
+                self.display.normalize_target_percent
+            ),
+            auto_tvg_active=self.display.auto_tvg_active,
+            auto_tvg_gain_db=tuple(
+                round(value, 6) for value in self.display.auto_tvg_gain_db
+            ),
+            speed_correction_px_per_ping=self.along_track_spin.value(),
+            processing_mode=str(self.processing_mode.currentData()),
+            egn_table_path=portable_egn_table_path(egn_path, self.filepath),
+        )
+
+    def _save_file_gain_settings(self) -> bool:
+        if self._restoring_gain_settings:
+            return False
+        try:
+            save_gain_settings(self.filepath, self._current_file_gain_settings())
+        except Exception as exc:
+            self.statusBar().showMessage(
+                f"Could not save TVG gain settings: {exc}", 8000
+            )
+            return False
+        return True
+
+    def _flush_pending_gain_settings_save(self) -> None:
+        if self.gain_settings_save_timer.isActive():
+            self.gain_settings_save_timer.stop()
+            self._save_file_gain_settings()
+
+    def _reset_file_gain_settings(self) -> None:
+        self.display.clear_normalization()
+        self.display.set_normalize_target_percent(
+            WaterfallGainModel.DEFAULT_NORMALIZE_TARGET_PERCENT
+        )
+        self.gain_spin.setValue(WaterfallGainModel.DEFAULT_OVERALL_GAIN_DB)
+        self.tvg_spreading_spin.setValue(
+            WaterfallGainModel.DEFAULT_TVG_SPREADING_DB_PER_DECADE
+        )
+        self.tvg_absorption_spin.setValue(
+            WaterfallGainModel.DEFAULT_TVG_ABSORPTION_DB_PER_M
+        )
+        self.along_track_spin.setValue(WaterfallView.DEFAULT_ALONG_TRACK_SCALE)
+        self.normalize_target_button.setText(
+            "Auto TVG Brightness Target: "
+            f"{self.display.normalize_target_percent}%…"
+        )
+        self.egn_path.clear()
+        raw_index = self.processing_mode.findData(BuiltInGainMode.RAW.value)
+        self.processing_mode.setCurrentIndex(raw_index)
+
+    def _apply_file_gain_settings(
+        self,
+        settings: SonarGainSettings,
+        *,
+        restore_auto_tvg: bool,
+    ) -> None:
+        self.display.clear_normalization()
+        self.gain_spin.setValue(settings.overall_gain_db)
+        self.tvg_spreading_spin.setValue(settings.tvg_spreading_db_per_decade)
+        self.tvg_absorption_spin.setValue(settings.tvg_absorption_db_per_m)
+        self.along_track_spin.setValue(settings.speed_correction_px_per_ping)
+        self.display.set_normalize_target_percent(
+            settings.auto_tvg_brightness_target_percent
+        )
+        self.normalize_target_button.setText(
+            "Auto TVG Brightness Target: "
+            f"{self.display.normalize_target_percent}%…"
+        )
+        egn_path = resolve_egn_table_path(settings, self.filepath)
+        self.egn_path.setText(str(egn_path) if egn_path is not None else "")
+        mode_index = self.processing_mode.findData(settings.processing_mode)
+        if mode_index < 0:
+            raise ValueError(
+                f"unsupported saved processing mode: {settings.processing_mode}"
+            )
+        self.processing_mode.setCurrentIndex(mode_index)
+        if settings.auto_tvg_active and restore_auto_tvg:
+            self.display.restore_auto_tvg_gain(settings.auto_tvg_gain_db)
+
+    def _restore_file_gain_settings(self) -> str | None:
+        settings_path = gain_settings_path(self.filepath)
+        self._pending_restored_gain_settings = None
+        try:
+            settings = load_gain_settings(self.filepath)
+        except Exception as exc:
+            self._restoring_gain_settings = True
+            try:
+                self._reset_file_gain_settings()
+            finally:
+                self._restoring_gain_settings = False
+            return f"Could not load {settings_path.name}: {exc}"
+
+        self._restoring_gain_settings = True
+        try:
+            if settings is None:
+                self._reset_file_gain_settings()
+            else:
+                if settings.source_file != self.filepath.name:
+                    raise ValueError(
+                        "saved source filename does not match the sonar file"
+                    )
+                is_egn = settings.processing_mode == BuiltInGainMode.EGN.value
+                self._apply_file_gain_settings(
+                    settings, restore_auto_tvg=not is_egn
+                )
+                if is_egn:
+                    self._pending_restored_gain_settings = settings
+        except Exception as exc:
+            self._reset_file_gain_settings()
+            return f"Could not apply {settings_path.name}: {exc}"
+        finally:
+            self._restoring_gain_settings = False
+
+        if settings is None:
+            if not self._save_file_gain_settings():
+                return f"Could not create {settings_path.name}"
+        elif settings.processing_mode == BuiltInGainMode.EGN.value:
+            QTimer.singleShot(0, self.apply_builtin_processing)
+        return None
 
     def _apply_context(self, context: SonarFileContext) -> None:
         # Kept in full (not just the fields picked out below) so a database
@@ -1670,11 +1882,10 @@ class QtContactPickerWindow(QMainWindow):
     def load_file(self, filepath: Path) -> None:
         """Switch the whole window to a different sonar file in place.
 
-        Gain, TVG, and along-track scale are deliberately preserved (they're
-        set on self.display/self.view, which this method never replaces or
-        resets) -- a processor tunes these once per session/instrument, not
-        per file. The same ContactStore/database is reused, so contacts
-        picked across every file in a folder land in one shared project.
+        Gain, TVG, Speed Correction, and processing mode are saved for the
+        old file and restored from the new file's sidecar. The same
+        ContactStore/database is reused, so contacts picked across every file
+        in a folder land in one shared project.
         """
 
         filepath = Path(filepath)
@@ -1682,6 +1893,7 @@ class QtContactPickerWindow(QMainWindow):
         # replaced below -- an edit sitting in the autosave debounce would
         # otherwise never get written.
         self._flush_pending_bottom_line_save()
+        self._flush_pending_gain_settings_save()
         self.statusBar().showMessage(f"Loading {filepath.name}…")
         QApplication.processEvents()
         try:
@@ -1703,9 +1915,6 @@ class QtContactPickerWindow(QMainWindow):
         ):
             self._directory_files = sonar_files_in_directory(context.filepath.parent)
         self.picker = _build_contact_picker(context, store=self.store, display=self.display)
-        # set_source() intentionally leaves overall_gain_db / TVG values
-        # untouched; only the data and this file's own calibrated range
-        # change, which is exactly the "persist gain across files" behavior.
         self.display.set_source(
             context.raw_waterfall,
             base_pipeline="qt-continuous-waterfall-v1|raw",
@@ -1714,6 +1923,7 @@ class QtContactPickerWindow(QMainWindow):
         self.processing_mode.setCurrentIndex(0)
         self.processing_progress.setValue(0)
         self.processing_status.setText("Raw display")
+        gain_settings_notice = self._restore_file_gain_settings()
 
         self.setWindowTitle(f"SidescanTools - Contact picker (Qt raster) — {filepath.name}")
         self.contact_dock.set_source_file(context.source_file_id)
@@ -1730,6 +1940,8 @@ class QtContactPickerWindow(QMainWindow):
         self._refresh_bottom_overlay()
         self._update_file_position()
         self._update_status(f"Opened {filepath.name}")
+        if gain_settings_notice:
+            self.statusBar().showMessage(gain_settings_notice, 8000)
 
     def _update_database_label(self) -> None:
         self.database_label.setText(f"Database: {self.contacts_db_path.name}")
@@ -1875,13 +2087,47 @@ class QtContactPickerWindow(QMainWindow):
     def _build_processing_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
+
+        gain_group = QGroupBox("Gain & TVG")
+        self._emphasize_sidebar_group(gain_group)
+        gain_layout = QVBoxLayout(gain_group)
+        gain_layout.addWidget(
+            self._sidebar_gain_control("Overall gain", self.gain_slider, self.gain_spin)
+        )
+        gain_layout.addWidget(
+            self._sidebar_gain_control(
+                "TVG spreading", self.tvg_spreading_slider, self.tvg_spreading_spin
+            )
+        )
+        gain_layout.addWidget(
+            self._sidebar_gain_control(
+                "TVG absorption", self.tvg_absorption_slider, self.tvg_absorption_spin
+            )
+        )
+        gain_layout.addWidget(self.normalize_tvg_button)
+        gain_layout.addWidget(self.normalize_target_button)
+        gain_layout.addWidget(self.reset_gain_button)
+        layout.addWidget(gain_group)
+
+        view_group = QGroupBox("View")
+        self._emphasize_sidebar_group(view_group)
+        view_layout = QVBoxLayout(view_group)
+        view_layout.addWidget(
+            self._sidebar_gain_control(
+                "Speed Correction", self.along_track_slider, self.along_track_spin
+            )
+        )
+        view_layout.addWidget(self.reset_view_button)
+        layout.addWidget(view_group)
+
+        egn_group = QGroupBox("EGN Settings & Options")
+        self._emphasize_sidebar_group(egn_group)
+        egn_layout = QVBoxLayout(egn_group)
         form = QFormLayout()
 
         self.processing_mode = QComboBox()
         for label, mode in (
             ("Raw waterfall", BuiltInGainMode.RAW),
-            ("Slant-range corrected", BuiltInGainMode.SLANT),
-            ("Beam Angle Correction (BAC)", BuiltInGainMode.BAC),
             ("Empirical Gain Normalization (EGN)", BuiltInGainMode.EGN),
         ):
             self.processing_mode.addItem(label, mode.value)
@@ -1906,31 +2152,7 @@ class QtContactPickerWindow(QMainWindow):
         form.addRow("EGN table", egn_row)
         self.egn_browse_button = browse_egn
         self.egn_build_button = build_egn
-
-        self.bac_resolution = QSpinBox()
-        self.bac_resolution.setRange(36, 1440)
-        self.bac_resolution.setValue(360)
-        self.bac_resolution.setSingleStep(36)
-        form.addRow("BAC angle bins", self.bac_resolution)
-
-        self.energy_normalization = QCheckBox("Normalize ping energy after BAC")
-        self.energy_normalization.setChecked(True)
-        form.addRow("", self.energy_normalization)
-
-        self.nadir_angle = QDoubleSpinBox()
-        self.nadir_angle.setRange(0.0, 89.0)
-        self.nadir_angle.setDecimals(1)
-        self.nadir_angle.setSuffix("°")
-        form.addRow("Nadir angle", self.nadir_angle)
-
-        self.internal_altitude = QCheckBox("Use logged sensor altitude")
-        form.addRow("", self.internal_altitude)
-
-        self.convert_db = QCheckBox("Convert processed intensity to dB")
-        self.apply_clahe = QCheckBox("Apply adaptive histogram equalization (CLAHE)")
-        form.addRow("", self.convert_db)
-        form.addRow("", self.apply_clahe)
-        layout.addLayout(form)
+        egn_layout.addLayout(form)
 
         processing_buttons = QHBoxLayout()
         self.apply_processing_button = QPushButton("Apply")
@@ -1939,37 +2161,82 @@ class QtContactPickerWindow(QMainWindow):
         reset_button.clicked.connect(self.show_raw_waterfall)
         processing_buttons.addWidget(self.apply_processing_button)
         processing_buttons.addWidget(reset_button)
-        layout.addLayout(processing_buttons)
+        egn_layout.addLayout(processing_buttons)
 
         self.processing_progress = QProgressBar()
         self.processing_progress.setRange(0, 100)
         self.processing_progress.setValue(0)
         self.processing_status = QLabel("Raw display")
         self.processing_status.setWordWrap(True)
-        layout.addWidget(self.processing_progress)
-        layout.addWidget(self.processing_status)
+        egn_layout.addWidget(self.processing_progress)
+        egn_layout.addWidget(self.processing_status)
+        layout.addWidget(egn_group)
         layout.addStretch(1)
         self._processing_mode_changed()
         return panel
 
+    @staticmethod
+    def _sidebar_gain_control(
+        label: str, slider: QSlider, spin: QDoubleSpinBox
+    ) -> QWidget:
+        control = QWidget()
+        layout = QVBoxLayout(control)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        spin.setMinimumHeight(36)
+        spin.setMinimumWidth(90)
+        minus = QToolButton()
+        minus.setText("−")
+        plus = QToolButton()
+        plus.setText("+")
+        for button in (minus, plus):
+            button.setFixedSize(36, 36)
+            button.setAutoRepeat(True)
+            button.setAutoRepeatDelay(400)
+            button.setAutoRepeatInterval(70)
+        minus.clicked.connect(lambda: spin.stepBy(-1))
+        plus.clicked.connect(lambda: spin.stepBy(1))
+
+        value_row = QHBoxLayout()
+        value_row.addWidget(QLabel(label))
+        value_row.addStretch(1)
+        value_row.addWidget(minus)
+        value_row.addWidget(spin)
+        value_row.addWidget(plus)
+        layout.addLayout(value_row)
+        layout.addWidget(slider)
+        return control
+
+    @staticmethod
+    def _emphasize_sidebar_group(group: QGroupBox) -> None:
+        group.setStyleSheet(
+            "QGroupBox {"
+            " border: 2px solid #202020;"
+            " border-radius: 4px;"
+            " margin-top: 10px;"
+            " padding-top: 8px;"
+            " font-weight: 600;"
+            "}"
+            "QGroupBox::title {"
+            " subcontrol-origin: margin;"
+            " left: 8px;"
+            " padding: 0 4px;"
+            "}"
+        )
+
     def _processing_mode_changed(self, *args) -> None:
         mode = BuiltInGainMode(self.processing_mode.currentData())
         is_egn = mode is BuiltInGainMode.EGN
-        is_bac = mode is BuiltInGainMode.BAC
         self.egn_path.setEnabled(is_egn)
         self.egn_browse_button.setEnabled(is_egn)
-        # Building a table is independent of which mode is currently applied
-        # for display -- in fact the common case is building one before any
-        # table exists to select, so this must not be gated on is_egn.
-        self.bac_resolution.setEnabled(is_bac)
-        self.energy_normalization.setEnabled(is_bac)
 
     def open_egn_table_builder(self) -> None:
         dialog = EGNTableBuilderDialog(self, initial_directory=self.filepath.parent)
         dialog.exec()
         if dialog.result_table_path is not None:
             self.egn_path.setText(str(dialog.result_table_path))
-            self._load_egn_nadir_angle(dialog.result_table_path)
 
     def browse_egn_table(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
@@ -1981,16 +2248,6 @@ class QtContactPickerWindow(QMainWindow):
         if not filename:
             return
         self.egn_path.setText(filename)
-        self._load_egn_nadir_angle(Path(filename))
-
-    def _load_egn_nadir_angle(self, table_path: Path) -> None:
-        try:
-            with np.load(table_path) as table:
-                if "nadir_angle" in table:
-                    self.nadir_angle.setValue(float(table["nadir_angle"]))
-        except Exception:
-            # Validation and a useful error are provided when Apply is pressed.
-            pass
 
     def apply_builtin_processing(self) -> None:
         try:
@@ -2003,12 +2260,7 @@ class QtContactPickerWindow(QMainWindow):
             request = BuiltInGainRequest(
                 mode=mode,
                 egn_table_path=egn_path,
-                bac_angle_count=self.bac_resolution.value(),
-                energy_normalization=self.energy_normalization.isChecked(),
-                convert_db=self.convert_db.isChecked(),
-                clahe=self.apply_clahe.isChecked(),
-                nadir_angle=self.nadir_angle.value(),
-                use_internal_altitude=self.internal_altitude.isChecked(),
+                nadir_angle=egn_table_nadir_angle(egn_path),
             )
         except Exception as exc:
             self.processing_status.setText(str(exc))
@@ -2033,21 +2285,38 @@ class QtContactPickerWindow(QMainWindow):
             result.display_data,
             base_pipeline=result.pipeline_description,
         )
+        restore_warning = None
+        if self._pending_restored_gain_settings is not None:
+            settings = self._pending_restored_gain_settings
+            self._pending_restored_gain_settings = None
+            self._restoring_gain_settings = True
+            try:
+                self._apply_file_gain_settings(settings, restore_auto_tvg=True)
+            except ValueError as exc:
+                restore_warning = (
+                    f"Processing ready; saved Auto TVG was not restored: {exc}"
+                )
+            finally:
+                self._restoring_gain_settings = False
         self.view.set_image(self.display.render_rgb())
         self.processing_progress.setValue(100)
         self.processing_status.setText(
-            "Active: " + result.pipeline_description.replace("|", " · ")
+            restore_warning
+            or "Active: " + result.pipeline_description.replace("|", " · ")
         )
         self.apply_processing_button.setEnabled(True)
         self.processing_worker = None
+        self._schedule_gain_settings_save()
         self._update_status()
 
     def _processing_failed(self, message: str) -> None:
+        self._pending_restored_gain_settings = None
         self.processing_status.setText(f"Processing failed: {message}")
         self.apply_processing_button.setEnabled(True)
         self.processing_worker = None
 
     def show_raw_waterfall(self) -> None:
+        self._pending_restored_gain_settings = None
         self.display.set_source(
             self.raw_waterfall,
             base_pipeline="qt-continuous-waterfall-v1|raw",
@@ -2056,6 +2325,7 @@ class QtContactPickerWindow(QMainWindow):
         self.processing_progress.setValue(0)
         self.processing_status.setText("Raw display")
         self.view.set_image(self.display.render_rgb())
+        self._schedule_gain_settings_save()
         self._update_status()
 
     def _build_bottom_line_panel(self) -> QWidget:
@@ -2368,6 +2638,7 @@ class QtContactPickerWindow(QMainWindow):
         self.tvg_absorption_spin.setValue(
             WaterfallGainModel.DEFAULT_TVG_ABSORPTION_DB_PER_M
         )
+        self._schedule_gain_settings_save()
         self.render_gain()
 
     def normalize_tvg(self) -> None:
@@ -2381,11 +2652,31 @@ class QtContactPickerWindow(QMainWindow):
         self.tvg_absorption_spin.setValue(absorption)
         self.render_gain()
         self.statusBar().showMessage(
-            "Swath brightness equalized around 50%; "
+            "Swath brightness equalized around "
+            f"{self.display.normalize_target_percent}%; "
             f"gain {overall:+.1f} dB, "
             f"spreading {spreading:+.1f} dB/decade, "
             f"absorption {absorption:+.2f} dB/m"
         )
+        self._schedule_gain_settings_save()
+
+    def set_normalize_target(self) -> None:
+        target_percent, accepted = QInputDialog.getInt(
+            self,
+            "Auto TVG Brightness Target",
+            "Target brightness:",
+            self.display.normalize_target_percent,
+            WaterfallGainModel.MIN_NORMALIZE_TARGET_PERCENT,
+            WaterfallGainModel.MAX_NORMALIZE_TARGET_PERCENT,
+            1,
+        )
+        if not accepted:
+            return
+        self.display.set_normalize_target_percent(target_percent)
+        self.normalize_target_button.setText(
+            f"Auto TVG Brightness Target: {target_percent}%…"
+        )
+        self.normalize_tvg()
 
     def render_gain(self) -> None:
         self.view.set_image(self.display.render_rgb())
@@ -2494,6 +2785,7 @@ class QtContactPickerWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._flush_pending_bottom_line_save()
+        self._flush_pending_gain_settings_save()
         self.store.close()
         super().closeEvent(event)
 

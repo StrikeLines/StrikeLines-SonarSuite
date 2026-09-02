@@ -9,5 +9,6 @@ __pycache__/
 *.jsf
 *.xtf
 *_bottom_info.npz
+*.tvg_gain.cfg
 egn_table_*.npz
 *.sqlite
