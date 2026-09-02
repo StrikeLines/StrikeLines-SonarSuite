@@ -1,22 +1,15 @@
 
 # SidescanTools — StrikeLines Fork
 
-> This repository is a Windows-focused fork of
-> [sonoware/sidescantools](https://github.com/sonoware/sidescantools). It
-> preserves the original processing, Napari, CLI, and GeoTIFF workflows while
-> adding a Qt raster workspace for contact picking, bottom-line editing, and
-> interactive gain adjustment.
+> This repository is a Windows-compatible fork of
+> [sonoware/sidescantools](https://github.com/sonoware/sidescantools). It adds a Qt raster workspace for digitizing contacts,
+> exporting contacts, bottom-line editing, and interactive gain adjustment.
 
 ## What this fork adds
 
-- **Windows-friendly Qt waterfall viewer.** A continuous, OpenGL-free Qt
-  raster viewer provides a practical fallback on Windows systems where Napari
-  or its OpenGL stack is unavailable or unreliable. Napari has not been
-  removed; it remains available for the original workflows. The Qt viewer is
-  selected automatically by the contact-picker launcher on Windows and can
-  also be requested explicitly.
+- **Windows-friendly Qt waterfall viewer.** A Qt based sonar scrollable waterfall view that runs on windows without OpenGL dependencies. 
 - **Persistent sonar contact picker.** Click a return in the waterfall to save
-  a contact, then add a name and notes. Contacts are stored in a reusable SQLite
+  a contact, then add a name and notes. Contacts are stored in a SQLite
   project database with their source file, ping, channel, sample position,
   display intensity, geometry settings, and generated thumbnail. A single
   database can span multiple survey files.
@@ -27,28 +20,14 @@
   GPX waypoints.
 - **Fine-grained display gain and TVG.** The Qt waterfall exposes overall gain,
   logarithmic spreading compensation, linear absorption compensation, and
-  along-track display scale. The **Normalize** action equalizes typical
-  brightness across port and starboard, raises dark regions, reduces blown-out
-  regions, and targets the middle of the visible range while using an overall
-  gain baseline of approximately -10 dB.
-- **Integrated processing controls.** Switch the display between raw,
-  slant-range corrected, Beam Angle Correction (BAC), and Empirical Gain
-  Normalization (EGN) data. The Qt workflow also includes EGN table selection
-  and a multi-file EGN table builder.
-- **Overhauled bottom-line workflow.** View and edit the bottom line directly
-  over the continuous waterfall, recalculate the current chunk or whole file,
-  refine it using logged sensor altitude, and choose how port and starboard
-  edits are combined. Changes auto-save beside the sonar file as
-  `<name>_bottom_info.npz` and use the same format as the CLI and EGN tools.
-- **Multi-file project workflow.** Open files directly or move to the previous
+  along-track display scale. 
+- **New bottom-line workflow.** View and edit the bottom line directly
+  over the continuous waterfall. Automatic bottom line detection. Manually trace bottom line to edit.
+  Changes auto-save beside the sonar file as
+  `<name>_bottom_info.npz`.
+- **Work in multiple sonar files.** Open files directly or move to the previous
   and next JSF/XTF file in a folder while retaining the contact database and
-  session display settings. An optional redesigned Qt layout is available with
-  `--ui v2`.
-- **Processing and geometry reliability work.** The fork adds shared
-  bottom-line I/O, endpoint-preserving sample mapping, JSF/XTF orientation
-  checks, downsampling-aware correction paths, and parity tests tying contact
-  coordinates and processing results back to the existing georeferencing
-  pipeline.
+  session display settings. 
 
 ## Qt contact-picker workspace
 
@@ -58,45 +37,12 @@
 port/starboard waterfall, gain and TVG controls, and persistent sonar contact
 list.*
 
-SidescanTools is an open-source software to read and <br />
-<img align="right" width="250" height="250" src="./src/sidescantools/res/sidescantools_logo_rund.png" hspace="25" title="Logo design and artwork by Aili Xue">
-process data from side-scan sonar instruments. <br />
-This tool can be used to create high-resolution 2D images of the sea floor.
-The data can be processed to reduce noise, apply slant-range correction and gain normalisation on a set of side-scan files.
-They can then be exported as `.geotiff` or simple `.png` files.
-As of now, SidescanTools can process and read data from the following formats:
-- .jsf: open file format by EdgeTech
-- .xtf: cross-platform readable file format
 
-# Sidescan Processing Overview
-The main processing steps of SidescanTools are:
-1. [**Bottom-line Detection**](#bottom-line-detection-bld), automatic or assisted using waterfall view
-2. **Slant-range Correction**: A geometric correction to calculate the ground range by projecting slant ranges onto the seafloor, which is assumed to be flat
-3. **Radiometric Corrections**:
-   - Filter stripe noise using a 2D-FFT filter
-   - Apply sharpening filter
-   - Apply one of two **Gain Normalization** Strategies:
+# Windows Installation
 
-     - Beam Angle Correction (BAC): Average intensities **per beam angle** over all pings in a single file
-     - Empirical Gain Normalization (EGN): Average intensities **per beam angle and distance** over all pings of all loaded files
-
-   **_Notes_**:
-     - EGN needs quite some data for good performance. If only few data exist, please use BAC instead.
-     - EGN only works for files created using the *same* instrument.
-       A good approach is one EGN table per survey/day and per instrument.
-
-4. **View and Export**
-   - View data of the different steps in [napari](https://napari.org/) to examine procesing results
-   - Export data as **georeferenced image** to view on a map
-   - If only a simple image is needed, a waterfall image can also be exported
-
-# Installation
-
-Python 3.12 is required. Miniconda or Anaconda is strongly recommended because
-GDAL, PyGMT, Qt, Napari, and the geospatial libraries are substantially easier
-to install from Conda than from PyPI on Windows.
-
-## Full GUI and Qt contact-picker environment
+Requirements: 
+-Python 3.12 
+-Miniconda or Anaconda
 
 Open **Anaconda Prompt** or a Conda-enabled PowerShell and run:
 
