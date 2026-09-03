@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from qtpy.QtCore import QEvent, QObject, QPoint, QRunnable, Qt, QTimer, Signal
 from qtpy.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QGraphicsItem,
@@ -73,6 +74,7 @@ def test_qt_startup_without_a_file_opens_idle_workspace(qtbot, monkeypatch):
 
     assert isinstance(window, QtContactPickerStartWindow)
     assert window.file_position_label.text() == "No sonar file selected"
+    assert not QApplication.instance().windowIcon().isNull()
     assert window.open_button.isEnabled()
     assert not window.previous_file_button.isEnabled()
     assert not window.next_file_button.isEnabled()

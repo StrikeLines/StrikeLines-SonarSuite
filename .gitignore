@@ -4,6 +4,9 @@ __pycache__/
 .pytest_tmp*/
 .venv/
 *.egg-info/
+/build/
+/dist/
+sidescantools-smoke-error.txt
 
 # Local sonar surveys and generated processing/project data
 *.jsf

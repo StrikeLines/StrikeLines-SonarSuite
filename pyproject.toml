@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sidescantools"
-version = "1.0.0"
+version = "1.0.1"
 description = "Tools for sidescan sonar processing"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -25,3 +25,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+sidescantools = ["res/*.ico", "res/*.png"]

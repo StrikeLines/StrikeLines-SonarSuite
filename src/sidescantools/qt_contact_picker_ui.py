@@ -14,7 +14,16 @@ from typing import Callable
 
 import numpy as np
 from qtpy.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
-from qtpy.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QBrush, QTransform
+from qtpy.QtGui import (
+    QBrush,
+    QColor,
+    QIcon,
+    QImage,
+    QPainter,
+    QPen,
+    QPixmap,
+    QTransform,
+)
 from qtpy.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -3470,6 +3479,9 @@ def run_qt_contact_picker(
     workspace. The user can then choose a file with the normal Open button.
     """
     application = QApplication.instance() or QApplication([])
+    icon_path = Path(__file__).resolve().parent / "res" / "icon.ico"
+    if icon_path.is_file():
+        application.setWindowIcon(QIcon(str(icon_path)))
 
     if filepath is None:
         initial_directory = Path(work_dir) if work_dir is not None else None
