@@ -5,11 +5,14 @@
 > [sonoware/sidescantools](https://github.com/sonoware/sidescantools). It adds a Qt raster workspace for digitizing contacts,
 > exporting contacts and GeoTIFFs, bottom-line editing, and interactive sonar
 > processing and gain adjustment.
+>
+> The goal of this project is to create an open-source alternative to the commercial SonarWiz package by Chesapeake.
+> We aim to replicate the familiar SonarWiz side-scan processing workflow. Sonar file import, bottom track, adjusting gain, filtering, digitizing contacts, and exporting contacts and geotiff mosaics for GIS software. 
 
 ## What this fork adds
 
 - **Windows-friendly Qt waterfall viewer.** A Qt based sonar scrollable waterfall view that runs on windows without OpenGL dependencies. 
-- **Persistent sonar contact picker.** Click a return in the waterfall to save
+- **Sonar contact picker.** Click a return in the waterfall to save
   a contact, then add a name and notes. Contacts are stored in a SQLite
   project database with their source file, ping, channel, sample position,
   display intensity, geometry settings, and generated thumbnail. A single
