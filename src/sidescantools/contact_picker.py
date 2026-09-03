@@ -211,30 +211,7 @@ class ContactPickerService:
             source_ping_count=self.sidescan_file.num_ping,
             source_sample_count=self.sidescan_file.ping_len,
         )
-        geometry = self.geometry_by_channel.get(anchor.channel)
-        if geometry is None:
-            raise InvalidContactPixel(
-                f"geometry is not prepared for the {anchor.channel.label} channel"
-            )
-        if geometry.geometry_settings.settings_hash != self._active_settings_hash:
-            raise InvalidContactPixel("prepared geometry does not match the active profile")
-
-        longitude, latitude = geometry.coordinate_for_fraction(
-            anchor.global_ping_index, anchor.sample_fraction
-        )
-        coordinate = ContactCoordinate(
-            longitude=longitude,
-            latitude=latitude,
-            slant_range_m=self._fractional_range(
-                geometry.slant_range_m[anchor.global_ping_index],
-                anchor.sample_fraction,
-            ),
-            ground_range_m=self._fractional_range(
-                geometry.ground_range_m[anchor.global_ping_index],
-                anchor.sample_fraction,
-            ),
-            geometry_profile_id=self.geometry_profile_id,
-        )
+        coordinate = self.coordinate_for_anchor(anchor)
         source_data_sample = source_array_sample_for_anchor(
             anchor, source_sample_count=self.sidescan_file.ping_len
         )
@@ -271,6 +248,34 @@ class ContactPickerService:
         return PickContactResult(
             contact=self.store.create_contact(draft, thumbnail),
             thumbnail_warning=thumbnail_warning,
+        )
+
+    def coordinate_for_anchor(self, anchor: ContactAnchor) -> ContactCoordinate:
+        """Derive a coordinate from the currently active geometry profile."""
+
+        geometry = self.geometry_by_channel.get(anchor.channel)
+        if geometry is None:
+            raise InvalidContactPixel(
+                f"geometry is not prepared for the {anchor.channel.label} channel"
+            )
+        if geometry.geometry_settings.settings_hash != self._active_settings_hash:
+            raise InvalidContactPixel("prepared geometry does not match the active profile")
+
+        longitude, latitude = geometry.coordinate_for_fraction(
+            anchor.global_ping_index, anchor.sample_fraction
+        )
+        return ContactCoordinate(
+            longitude=longitude,
+            latitude=latitude,
+            slant_range_m=self._fractional_range(
+                geometry.slant_range_m[anchor.global_ping_index],
+                anchor.sample_fraction,
+            ),
+            ground_range_m=self._fractional_range(
+                geometry.ground_range_m[anchor.global_ping_index],
+                anchor.sample_fraction,
+            ),
+            geometry_profile_id=self.geometry_profile_id,
         )
 
     def _display_intensity(self, anchor: ContactAnchor) -> float:

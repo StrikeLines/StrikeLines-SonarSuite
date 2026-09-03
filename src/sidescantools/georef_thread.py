@@ -280,7 +280,7 @@ class Georeferencer:
 
         # add offsets following: https://apps.dtic.mil/sti/pdfs/AD1005010.pdf
         #
-        layback = math.sin(np.deg2rad(45)) * self.cable_out
+        layback = self.geometry_settings.effective_layback_m
         north_offset = []
         east_offset = []
         lalo_offset = []

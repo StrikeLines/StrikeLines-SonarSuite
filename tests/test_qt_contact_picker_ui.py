@@ -28,10 +28,12 @@ from sidescantools.gain_settings import (
     save_gain_settings,
 )
 from sidescantools.interaction_mode import InteractionModeController
+from sidescantools.layback import TowDataSummary
 from sidescantools.qt_contact_picker_ui import (
     EGNTableBuildCoordinator,
     EGNTableBuilderDialog,
     QtContactPickerWindow,
+    QtContactPickerStartWindow,
     SonarFileContext,
     SonarLoaderSettings,
     WaterfallGainModel,
@@ -40,6 +42,7 @@ from sidescantools.qt_contact_picker_ui import (
     logical_waterfall,
     sonar_files_in_directory,
     waterfall_rgb,
+    run_qt_contact_picker,
 )
 from sidescantools.sidescan_preproc import SidescanPreprocessor
 from sidescantools.swath_geometry import GeometrySettings
@@ -53,6 +56,50 @@ def test_waterfall_rgb_is_uint8_and_preserves_shape():
     assert result.shape == (2, 3, 3)
     assert result.dtype == np.uint8
     assert tuple(result[1, 0]) == (0, 0, 0)
+
+
+def test_qt_startup_without_a_file_opens_idle_workspace(qtbot, monkeypatch):
+    def unexpected_dialog(*args, **kwargs):
+        raise AssertionError("startup must not open a file dialog")
+
+    monkeypatch.setattr(
+        qt_contact_picker_ui.QFileDialog,
+        "getOpenFileName",
+        staticmethod(unexpected_dialog),
+    )
+
+    window = run_qt_contact_picker(None, block=False)
+    qtbot.addWidget(window)
+
+    assert isinstance(window, QtContactPickerStartWindow)
+    assert window.file_position_label.text() == "No sonar file selected"
+    assert window.open_button.isEnabled()
+    assert not window.previous_file_button.isEnabled()
+    assert not window.next_file_button.isEnabled()
+
+
+def test_idle_workspace_opens_selected_file_through_open_button(
+    qtbot, monkeypatch, tmp_path
+):
+    sonar_path = tmp_path / "line.jsf"
+    sonar_path.touch()
+    opened = []
+    loaded_window = QMainWindow()
+    qtbot.addWidget(loaded_window)
+    window = QtContactPickerStartWindow(
+        lambda path: opened.append(path) or loaded_window
+    )
+    qtbot.addWidget(window)
+    monkeypatch.setattr(
+        qt_contact_picker_ui.QFileDialog,
+        "getOpenFileName",
+        staticmethod(lambda *args, **kwargs: (str(sonar_path), "")),
+    )
+
+    window.open_button.click()
+
+    assert opened == [sonar_path]
+    assert window._loaded_window is loaded_window
 
 
 def test_logical_waterfall_stitches_chunks_and_removes_padding():
@@ -215,6 +262,68 @@ def test_processing_panel_starts_with_gain_and_view_controls(qtbot, tmp_path):
         assert removed_text not in visible_text
 
 
+def test_bottom_threshold_recalculates_the_whole_file_after_debounce(qtbot):
+    window = QMainWindow()
+    qtbot.addWidget(window)
+    recalculations = []
+    window.loader_settings = SimpleNamespace(default_threshold=0.70)
+    window.preprocessor = SimpleNamespace(
+        bottom_strategy_choices=[
+            "Each side individually",
+            "Combine both sides",
+            "Only use portside",
+            "Only use starboard",
+        ]
+    )
+    window.sidescan_file = SimpleNamespace(
+        sensor_primary_altitude=np.zeros(2)
+    )
+    window.context = SimpleNamespace(bottom_info_status="Ready")
+    window._fine_control = QtContactPickerWindow._fine_control
+    window.recalc_bottom_whole_file = lambda: recalculations.append(True)
+    window.refine_bottom_with_altitude = lambda: None
+    window._toggle_bottom_edit = lambda checked: None
+    window._autosave_bottom_line = lambda: None
+
+    panel = QtContactPickerWindow._build_bottom_line_panel(window)
+    qtbot.addWidget(panel)
+
+    button_text = [button.text() for button in panel.findChildren(QPushButton)]
+    assert "Recalculate Current Chunk" not in button_text
+    assert "Recalculate Whole File…" in button_text
+    assert window.bottom_recalc_timer.interval() == 400
+
+    window.bottom_threshold_spin.setValue(0.71)
+    qtbot.waitUntil(lambda: len(recalculations) == 1, timeout=1500)
+
+    assert recalculations == [True]
+
+
+def test_running_bottom_calculation_discards_stale_result_and_runs_latest(qtbot):
+    status = QLabel()
+    enabled = []
+    recalculations = []
+    window = SimpleNamespace(
+        _bottom_worker_source=Path("line.jsf"),
+        filepath=Path("line.jsf"),
+        bottom_worker=object(),
+        _pending_full_bottom_recalc=True,
+        bottom_status_label=status,
+        _set_bottom_controls_enabled=lambda value: enabled.append(value),
+        recalc_bottom_whole_file=lambda: recalculations.append(True),
+    )
+
+    QtContactPickerWindow._bottom_recalc_finished(
+        window, SimpleNamespace(portside_bottom_dist="obsolete")
+    )
+    qtbot.waitUntil(lambda: recalculations == [True], timeout=1000)
+
+    assert window.bottom_worker is None
+    assert window._pending_full_bottom_recalc is False
+    assert enabled == [True]
+    assert "latest" in status.text().lower()
+
+
 def test_geotiff_export_group_has_crs_and_file_or_batch_controls(qtbot):
     window = QMainWindow()
     qtbot.addWidget(window)
@@ -230,6 +339,40 @@ def test_geotiff_export_group_has_crs_and_file_or_batch_controls(qtbot):
     assert [window.geotiff_crs.itemData(index) for index in range(2)] == [4326, 3857]
     assert window.export_current_geotiff_button.text() == "Export Current File"
     assert window.export_directory_geotiff_button.text() == "Batch Export Directory…"
+
+
+def test_layback_group_displays_file_values_and_effective_override(qtbot):
+    window = QMainWindow()
+    qtbot.addWidget(window)
+    window._emphasize_sidebar_group = QtContactPickerWindow._emphasize_sidebar_group
+    window._update_layback_controls = (
+        QtContactPickerWindow._update_layback_controls.__get__(window)
+    )
+    window._tow_value_text = QtContactPickerWindow._tow_value_text
+    window.apply_manual_layback = lambda: None
+    window.use_file_layback = lambda: None
+    window.loader_settings = SimpleNamespace(
+        geometry_settings=GeometrySettings(60)
+    )
+    window.context = SimpleNamespace(
+        tow_data=TowDataSummary(18.5, 52.0),
+        geometry_settings=GeometrySettings(60, cable_out_m=52, layback_m=24.0),
+        layback_source="Manual layback override",
+    )
+    window._layback_override_m = 24.0
+
+    group = QtContactPickerWindow._build_layback_group(window)
+    qtbot.addWidget(group)
+
+    assert group.title() == "Towfish Layback"
+    assert "border: 2px solid" in group.styleSheet()
+    assert window.recorded_layback_label.text() == "18.5 m"
+    assert window.recorded_cable_out_label.text() == "52.0 m"
+    assert window.layback_spin.value() == 24.0
+    assert window.apply_layback_button.text() == "Apply Layback"
+    assert window.use_file_layback_button.text() == "Use File Value"
+    assert window.use_file_layback_button.isEnabled()
+    assert window.layback_status_label.text() == "Manual layback override"
 
 
 def test_egn_table_nadir_angle_uses_saved_metadata(tmp_path):

@@ -30,6 +30,20 @@ class GeometrySettingsTests(unittest.TestCase):
 
         self.assertNotEqual(original.settings_hash, changed.settings_hash)
 
+    def test_direct_layback_overrides_legacy_cable_out_estimate(self):
+        settings = GeometrySettings(60, cable_out_m=100, layback_m=25)
+
+        self.assertEqual(settings.effective_layback_m, 25)
+        self.assertNotEqual(
+            settings.settings_hash,
+            GeometrySettings(60, cable_out_m=100).settings_hash,
+        )
+
+    def test_default_serialization_remains_compatible_with_existing_profiles(self):
+        settings = GeometrySettings(60, cable_out_m=10)
+
+        self.assertNotIn("layback_m", settings.to_json())
+
 
 class SwathGeometryTests(unittest.TestCase):
     def setUp(self):

@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from qtpy.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal
-from qtpy.QtGui import QPixmap
 from qtpy.QtWidgets import (
     QFileDialog,
     QFormLayout,
@@ -16,7 +15,6 @@ from qtpy.QtWidgets import (
     QMessageBox,
     QPushButton,
     QTableView,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -123,14 +121,8 @@ class ContactDock(QWidget):
         self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
         self.table.selectionModel().selectionChanged.connect(self._load_selection)
 
-        self.thumbnail_label = QLabel("No thumbnail")
-        self.thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.thumbnail_label.setMinimumHeight(150)
-        self.thumbnail_label.setStyleSheet("border: 1px solid palette(mid);")
-
         self.name_edit = QLineEdit()
-        self.notes_edit = QTextEdit()
-        self.notes_edit.setMaximumHeight(90)
+        self.notes_edit = QLineEdit()
         self.classification_edit = QLineEdit()
         form = QFormLayout()
         form.addRow("Name", self.name_edit)
@@ -160,12 +152,22 @@ class ContactDock(QWidget):
         waypoint_buttons.addWidget(self.export_selected_button)
         waypoint_buttons.addWidget(self.export_all_button)
 
+        self.contact_list_group = QGroupBox("Contact List")
+        self.contact_list_group.setStyleSheet(
+            "QGroupBox { border: 2px solid #111; border-radius: 3px; "
+            "margin-top: 0.7em; padding-top: 0.5em; } "
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; "
+            "padding: 0 4px; }"
+        )
+        contact_list_layout = QVBoxLayout(self.contact_list_group)
+        contact_list_layout.addWidget(self.status)
+        contact_list_layout.addWidget(self.table)
+        contact_list_layout.addLayout(form)
+        contact_list_layout.addLayout(editor_buttons)
+
         layout = QVBoxLayout(self)
-        layout.addWidget(self.status)
-        layout.addWidget(self.table)
-        layout.addWidget(self.thumbnail_label)
-        layout.addLayout(form)
-        layout.addLayout(editor_buttons)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.contact_list_group, 1)
         layout.addWidget(self.waypoint_export_group)
         self._set_editor_enabled(False)
 
@@ -247,7 +249,7 @@ class ContactDock(QWidget):
         updated = self.store.update_contact_text(
             record.id,
             name=self.name_edit.text(),
-            notes=self.notes_edit.toPlainText(),
+            notes=self.notes_edit.text(),
             classification=self.classification_edit.text().strip() or None,
         )
         self.refresh(select_contact_id=updated.id)
@@ -309,10 +311,9 @@ class ContactDock(QWidget):
             self._clear_editor()
             return
         self.name_edit.setText(record.draft.name)
-        self.notes_edit.setPlainText(record.draft.notes)
+        self.notes_edit.setText(record.draft.notes)
         self.classification_edit.setText(record.draft.classification or "")
         self._loaded_contact_id = record.id
-        self._load_thumbnail(record.id)
         self._set_editor_enabled(True)
 
     def _autosave_if_dirty(self) -> None:
@@ -333,7 +334,7 @@ class ContactDock(QWidget):
         except KeyError:
             return
         name = self.name_edit.text()
-        notes = self.notes_edit.toPlainText()
+        notes = self.notes_edit.text()
         classification = self.classification_edit.text().strip() or None
         if (
             name == previous.draft.name
@@ -356,30 +357,15 @@ class ContactDock(QWidget):
         self.status.setText(f"Saved {updated.draft.name}")
         self.contact_updated.emit(updated.id)
 
-    def _load_thumbnail(self, contact_id: int) -> None:
-        thumbnail = self.store.get_thumbnail(contact_id)
-        if thumbnail is None:
-            self.thumbnail_label.setPixmap(QPixmap())
-            self.thumbnail_label.setText("No thumbnail")
-            return
-        pixmap = QPixmap()
-        pixmap.loadFromData(thumbnail.image_bytes)
-        self.thumbnail_label.setText("")
-        self.thumbnail_label.setPixmap(
-            pixmap.scaled(
-                280,
-                280,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
+    def flush_pending_edit(self) -> None:
+        """Persist the active contact editor before an external refresh."""
+
+        self._autosave_if_dirty()
 
     def _clear_editor(self) -> None:
         self.name_edit.clear()
         self.notes_edit.clear()
         self.classification_edit.clear()
-        self.thumbnail_label.setPixmap(QPixmap())
-        self.thumbnail_label.setText("No thumbnail")
         self._set_editor_enabled(False)
 
     def _set_editor_enabled(self, enabled: bool) -> None:

@@ -30,6 +30,7 @@ class SonarGainSettings:
     egn_table_path: str | None
     destripe_active: bool = False
     slant_range_correction_active: bool = False
+    layback_override_m: float | None = None
 
     def __post_init__(self) -> None:
         if self.processing_mode not in {"raw", "egn"}:
@@ -50,6 +51,12 @@ class SonarGainSettings:
             )
         if any(not math.isfinite(float(value)) for value in self.auto_tvg_gain_db):
             raise ValueError("auto_tvg_gain_db must contain only finite values")
+        if self.layback_override_m is not None:
+            if (
+                not math.isfinite(float(self.layback_override_m))
+                or self.layback_override_m < 0
+            ):
+                raise ValueError("layback_override_m must be finite and nonnegative")
 
     def to_dict(self) -> dict:
         return {
@@ -74,6 +81,7 @@ class SonarGainSettings:
                     self.slant_range_correction_active
                 ),
             },
+            "geometry": {"layback_override_m": self.layback_override_m},
         }
 
     @classmethod
@@ -84,6 +92,7 @@ class SonarGainSettings:
             )
         display = values["display"]
         processing = values["processing"]
+        geometry = values.get("geometry", {})
         return cls(
             source_file=str(values["source_file"]),
             overall_gain_db=float(display["overall_gain_db"]),
@@ -110,6 +119,11 @@ class SonarGainSettings:
             destripe_active=bool(processing.get("destripe_active", False)),
             slant_range_correction_active=bool(
                 processing.get("slant_range_correction_active", False)
+            ),
+            layback_override_m=(
+                float(geometry["layback_override_m"])
+                if geometry.get("layback_override_m") is not None
+                else None
             ),
         )
 

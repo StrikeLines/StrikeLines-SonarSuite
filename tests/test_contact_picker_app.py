@@ -34,7 +34,7 @@ def test_launcher_rejects_missing_input_for_napari_viewer():
 
 def test_launcher_allows_missing_input_for_qt_viewer(monkeypatch):
     # The desktop shortcut launches with no arguments at all; the Qt viewer
-    # is expected to prompt for a file itself instead of erroring here.
+    # is expected to open an idle workspace instead of erroring here.
     calls = {}
 
     def fake_run_qt_contact_picker(sonar_file, **kwargs):
@@ -50,6 +50,18 @@ def test_launcher_allows_missing_input_for_qt_viewer(monkeypatch):
 
     assert calls["sonar_file"] is None
     # Neither can be defaulted from a file that isn't known yet -- must stay
-    # None so run_qt_contact_picker resolves both after its dialog returns.
+    # None so run_qt_contact_picker resolves both after the user opens a file.
     assert calls["kwargs"]["work_dir"] is None
     assert calls["kwargs"]["contacts_db_path"] is None
+
+
+def test_launcher_without_arguments_selects_idle_qt_workspace(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "sidescantools.qt_contact_picker_ui.run_qt_contact_picker",
+        lambda sonar_file, **kwargs: calls.append(sonar_file),
+    )
+
+    main([])
+
+    assert calls == [None]

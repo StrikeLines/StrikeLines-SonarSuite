@@ -19,7 +19,13 @@ from sidescantools.qt_contact_picker_ui import WaterfallGainModel
 from sidescantools.swath_geometry import GeometrySettings, SwathGeometry
 
 
-def gain_settings(width, *, auto_tvg=False, slant_range_correction=False):
+def gain_settings(
+    width,
+    *,
+    auto_tvg=False,
+    slant_range_correction=False,
+    layback_override_m=None,
+):
     return SonarGainSettings(
         source_file="line.jsf",
         overall_gain_db=-7.0,
@@ -34,6 +40,7 @@ def gain_settings(width, *, auto_tvg=False, slant_range_correction=False):
         processing_mode="raw",
         egn_table_path=None,
         slant_range_correction_active=slant_range_correction,
+        layback_override_m=layback_override_m,
     )
 
 
@@ -177,6 +184,59 @@ def test_prepare_export_applies_saved_slant_range_setting(monkeypatch, tmp_path)
     assert len(requests) == 1
     assert requests[0].slant_range_correction is True
     assert "slant-range-corrected" in prepared.pipeline_description
+
+
+def test_prepare_export_applies_saved_manual_layback(monkeypatch, tmp_path):
+    from sidescantools import geotiff_export
+
+    source = tmp_path / "line.jsf"
+    source.touch()
+    save_gain_settings(source, gain_settings(8, layback_override_m=73.5))
+    sidescan_file = SimpleNamespace(
+        num_ping=4,
+        slant_range=np.full((2, 4), 40.0),
+        layback_m=np.full(4, 12.0),
+        cable_out_m=np.full(4, 50.0),
+    )
+    preprocessor = SimpleNamespace(
+        ping_len=4,
+        napari_fullmat=np.linspace(0.05, 0.8, 4 * 8).reshape(1, 4, 8),
+        init_napari_bottom_detect=lambda *args, **kwargs: None,
+    )
+    captured_settings = []
+
+    class FakeGeoreferencer:
+        def __init__(self, *args, channel, geometry_settings, **kwargs):
+            self.channel = channel
+            captured_settings.append(geometry_settings)
+
+        def prepare_swath_geometry(self):
+            return geometry(self.channel)
+
+    monkeypatch.setattr(geotiff_export, "_configure_pyproj_data", lambda: None)
+    monkeypatch.setattr(geotiff_export, "SidescanFile", lambda path: sidescan_file)
+    monkeypatch.setattr(
+        geotiff_export, "SidescanPreprocessor", lambda **kwargs: preprocessor
+    )
+    monkeypatch.setattr(
+        geotiff_export,
+        "compute_depth_info",
+        lambda current_file, factor: np.zeros(4),
+    )
+    monkeypatch.setattr(geotiff_export, "Georeferencer", FakeGeoreferencer)
+
+    prepare_sonar_export(
+        source,
+        chunk_size=4,
+        default_threshold=0.5,
+        downsampling_factor=1,
+        active_db=False,
+        active_hist_equal=False,
+        geometry_settings=GeometrySettings(60),
+    )
+
+    assert len(captured_settings) == 2
+    assert all(item.effective_layback_m == 73.5 for item in captured_settings)
 
 
 @pytest.mark.parametrize("epsg", [4326, 3857])

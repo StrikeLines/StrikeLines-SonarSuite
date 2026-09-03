@@ -19,8 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         nargs="?",
         default=None,
-        help="input .jsf or .xtf file (omit to pick one from a file dialog; "
-        "only supported with --viewer qt)",
+        help="input .jsf or .xtf file (omit to open an empty Qt workspace)",
     )
     parser.add_argument(
         "--work-dir",
@@ -56,7 +55,11 @@ def main(argv: list[str] | None = None) -> None:
 
     viewer_backend = arguments.viewer
     if viewer_backend == "auto":
-        viewer_backend = "qt" if sys.platform == "win32" else "napari"
+        viewer_backend = (
+            "qt"
+            if sys.platform == "win32" or arguments.sonar_file is None
+            else "napari"
+        )
 
     sonar_file = arguments.sonar_file.resolve() if arguments.sonar_file is not None else None
     if sonar_file is not None:
@@ -72,8 +75,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--downsampling-factor must be positive")
 
     # With no sonar_file, work_dir/contacts_db default relative to whatever
-    # file the user picks from the Open-file dialog on launch -- resolved
-    # later, inside run_qt_contact_picker, once that file is known.
+    # file the user later opens from the workspace -- resolved inside
+    # run_qt_contact_picker once that file is known.
     work_dir = arguments.work_dir.resolve() if arguments.work_dir is not None else None
     if work_dir is None and sonar_file is not None:
         work_dir = sonar_file.parent

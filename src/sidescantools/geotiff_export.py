@@ -34,6 +34,7 @@ from sidescantools.gain_settings import (
     resolve_egn_table_path,
 )
 from sidescantools.georef_thread import Georeferencer
+from sidescantools.layback import resolve_geometry_layback, summarize_tow_data
 from sidescantools.sidescan_file import SidescanFile
 from sidescantools.sidescan_preproc import SidescanPreprocessor
 from sidescantools.swath_geometry import GeometrySettings, SwathGeometry
@@ -203,6 +204,11 @@ def prepare_sonar_export(
 
     notify(2, "Reading sonar data")
     sidescan_file = SidescanFile(source)
+    effective_geometry_settings, _ = resolve_geometry_layback(
+        geometry_settings,
+        summarize_tow_data(sidescan_file),
+        manual_layback_m=settings.layback_override_m,
+    )
     preprocessor = SidescanPreprocessor(
         sidescan_file=sidescan_file,
         chunk_size=chunk_size,
@@ -263,7 +269,7 @@ def prepare_sonar_export(
             source,
             channel=channel,
             sidescan_file=sidescan_file,
-            geometry_settings=geometry_settings,
+            geometry_settings=effective_geometry_settings,
             output_folder=source.parent,
         ).prepare_swath_geometry()
         for channel in (0, 1)

@@ -10,6 +10,7 @@ import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 from qtpy.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
@@ -76,6 +77,11 @@ from sidescantools.geotiff_export import (
     geotiff_output_path,
 )
 from sidescantools.interaction_mode import InteractionMode, InteractionModeController
+from sidescantools.layback import (
+    TowDataSummary,
+    resolve_geometry_layback,
+    summarize_tow_data,
+)
 from sidescantools.sidescan_file import SidescanFile
 from sidescantools.sidescan_preproc import SidescanPreprocessor
 from sidescantools.swath_geometry import GeometrySettings
@@ -692,6 +698,28 @@ class SonarFileContext:
     geometry_profile_id: int
     slant_range_m: float
     bottom_info_status: str
+    geometry_settings: GeometrySettings | None = None
+    tow_data: TowDataSummary = TowDataSummary(None, None)
+    layback_source: str = "No recorded layback or cable out"
+    layback_override_m: float | None = None
+
+
+def _prepare_file_geometry(
+    filepath: Path,
+    sidescan_file: SidescanFile,
+    geometry_settings: GeometrySettings,
+    output_directory: Path,
+) -> dict:
+    return {
+        channel: Georeferencer(
+            filepath,
+            channel=channel,
+            sidescan_file=sidescan_file,
+            geometry_settings=geometry_settings,
+            output_folder=output_directory,
+        ).prepare_swath_geometry()
+        for channel in (0, 1)
+    }
 
 
 def _load_sonar_context(
@@ -712,6 +740,20 @@ def _load_sonar_context(
     filepath = Path(filepath).resolve()
     print(f"Loading {filepath.name}…")
     sidescan_file = SidescanFile(filepath)
+    tow_data = summarize_tow_data(sidescan_file)
+    try:
+        saved_settings = load_gain_settings(filepath)
+    except Exception:
+        # The window's normal settings restore path reports malformed sidecars.
+        saved_settings = None
+    layback_override_m = (
+        saved_settings.layback_override_m if saved_settings is not None else None
+    )
+    geometry_settings, layback_source = resolve_geometry_layback(
+        settings.geometry_settings,
+        tow_data,
+        manual_layback_m=layback_override_m,
+    )
     preprocessor = SidescanPreprocessor(
         sidescan_file=sidescan_file,
         chunk_size=settings.chunk_size,
@@ -745,16 +787,12 @@ def _load_sonar_context(
     built_in_processor = BuiltInGainProcessor(preprocessor, raw_waterfall)
 
     print("Preparing contact geometry…")
-    geometry = {
-        channel: Georeferencer(
-            filepath,
-            channel=channel,
-            sidescan_file=sidescan_file,
-            geometry_settings=settings.geometry_settings,
-            output_folder=settings.output_directory,
-        ).prepare_swath_geometry()
-        for channel in (0, 1)
-    }
+    geometry = _prepare_file_geometry(
+        filepath,
+        sidescan_file,
+        geometry_settings,
+        settings.output_directory,
+    )
     source_stat = filepath.stat()
     source = store.register_source_file(
         filepath,
@@ -764,7 +802,7 @@ def _load_sonar_context(
         file_size_bytes=source_stat.st_size,
         mtime_ns=source_stat.st_mtime_ns,
     )
-    profile_id = store.get_or_create_geometry_profile(settings.geometry_settings)
+    profile_id = store.get_or_create_geometry_profile(geometry_settings)
     store.mark_stale_for_profile(source.id, profile_id)
 
     return SonarFileContext(
@@ -778,6 +816,10 @@ def _load_sonar_context(
         geometry_profile_id=profile_id,
         slant_range_m=slant_range_m,
         bottom_info_status=bottom_info_status,
+        geometry_settings=geometry_settings,
+        tow_data=tow_data,
+        layback_source=layback_source,
+        layback_override_m=layback_override_m,
     )
 
 
@@ -802,7 +844,8 @@ def _register_in_store(
         file_size_bytes=source_stat.st_size,
         mtime_ns=source_stat.st_mtime_ns,
     )
-    profile_id = store.get_or_create_geometry_profile(settings.geometry_settings)
+    active_geometry_settings = context.geometry_settings or settings.geometry_settings
+    profile_id = store.get_or_create_geometry_profile(active_geometry_settings)
     store.mark_stale_for_profile(source.id, profile_id)
     return replace(context, source_file_id=source.id, geometry_profile_id=profile_id)
 
@@ -1508,6 +1551,8 @@ class QtContactPickerWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self.processing_worker = None
         self.bottom_worker = None
+        self._bottom_worker_source: Path | None = None
+        self._pending_full_bottom_recalc = False
         self.geotiff_worker = None
         self._restoring_gain_settings = False
         self._pending_restored_gain_settings = None
@@ -1676,13 +1721,21 @@ class QtContactPickerWindow(QMainWindow):
             self.source_file_id,
             export_directory=self.contacts_db_path.parent,
         )
-        self.contact_dock.set_geometry_status("Geometry ready", ready=True)
+        active_geometry_settings = (
+            self.context.geometry_settings or self.loader_settings.geometry_settings
+        )
+        self.contact_dock.set_geometry_status(
+            f"Geometry ready · layback "
+            f"{active_geometry_settings.effective_layback_m:.1f} m",
+            ready=True,
+        )
 
         contacts_panel = QWidget()
         contacts_panel_layout = QVBoxLayout(contacts_panel)
         contacts_panel_layout.setContentsMargins(0, 0, 0, 0)
         contacts_panel_layout.addLayout(database_row)
         contacts_panel_layout.addWidget(self.database_label)
+        contacts_panel_layout.addWidget(self._build_layback_group())
         contacts_panel_layout.addWidget(self.contact_dock, 1)
         contacts_panel_layout.addWidget(self._build_geotiff_export_group())
 
@@ -1810,6 +1863,7 @@ class QtContactPickerWindow(QMainWindow):
             slant_range_correction_active=(
                 self.slant_range_checkbox.isChecked()
             ),
+            layback_override_m=getattr(self, "_layback_override_m", None),
         )
 
     def _save_file_gain_settings(self) -> bool:
@@ -1849,6 +1903,10 @@ class QtContactPickerWindow(QMainWindow):
         self.egn_path.clear()
         self.destripe_button.setChecked(False)
         self.slant_range_checkbox.setChecked(False)
+        context = getattr(self, "context", None)
+        self._layback_override_m = getattr(context, "layback_override_m", None)
+        if hasattr(self, "_update_layback_controls"):
+            self._update_layback_controls()
         raw_index = self.processing_mode.findData(BuiltInGainMode.RAW.value)
         self.processing_mode.setCurrentIndex(raw_index)
 
@@ -1876,6 +1934,9 @@ class QtContactPickerWindow(QMainWindow):
         self.slant_range_checkbox.setChecked(
             settings.slant_range_correction_active
         )
+        self._layback_override_m = settings.layback_override_m
+        if hasattr(self, "_update_layback_controls"):
+            self._update_layback_controls()
         mode_index = self.processing_mode.findData(settings.processing_mode)
         if mode_index < 0:
             raise ValueError(
@@ -1945,6 +2006,7 @@ class QtContactPickerWindow(QMainWindow):
         self.raw_waterfall = context.raw_waterfall
         self.built_in_processor = context.built_in_processor
         self.source_file_id = context.source_file_id
+        self._layback_override_m = context.layback_override_m
 
     def open_file(self) -> None:
         start_dir = str(self.filepath.parent)
@@ -1997,6 +2059,8 @@ class QtContactPickerWindow(QMainWindow):
         """
 
         filepath = Path(filepath)
+        self.bottom_recalc_timer.stop()
+        self._pending_full_bottom_recalc = False
         # The current file's preprocessor/sidescan_file are about to be
         # replaced below -- an edit sitting in the autosave debounce would
         # otherwise never get written.
@@ -2035,7 +2099,15 @@ class QtContactPickerWindow(QMainWindow):
 
         self.setWindowTitle(f"SidescanTools - Contact picker (Qt raster) — {filepath.name}")
         self.contact_dock.set_source_file(context.source_file_id)
-        self.contact_dock.set_geometry_status("Geometry ready", ready=True)
+        active_geometry_settings = (
+            context.geometry_settings or self.loader_settings.geometry_settings
+        )
+        self.contact_dock.set_geometry_status(
+            f"Geometry ready · layback "
+            f"{active_geometry_settings.effective_layback_m:.1f} m",
+            ready=True,
+        )
+        self._update_layback_controls()
         # Editing is per-file state; switching files with it still on risks
         # painting corrections onto the wrong survey line.
         self.edit_bottom_button.setChecked(False)
@@ -2050,6 +2122,139 @@ class QtContactPickerWindow(QMainWindow):
         self._update_status(f"Opened {filepath.name}")
         if gain_settings_notice:
             self.statusBar().showMessage(gain_settings_notice, 8000)
+
+    def _build_layback_group(self) -> QGroupBox:
+        group = QGroupBox("Towfish Layback")
+        self._emphasize_sidebar_group(group)
+        layout = QVBoxLayout(group)
+        form = QFormLayout()
+        self.recorded_layback_label = QLabel()
+        self.recorded_cable_out_label = QLabel()
+        form.addRow("File layback", self.recorded_layback_label)
+        form.addRow("File cable out", self.recorded_cable_out_label)
+        self.layback_spin = QDoubleSpinBox()
+        self.layback_spin.setRange(0.0, 20_000.0)
+        self.layback_spin.setDecimals(1)
+        self.layback_spin.setSingleStep(1.0)
+        self.layback_spin.setSuffix(" m")
+        self.layback_spin.setToolTip(
+            "Layback used to move the towfish position behind the navigation "
+            "track. Apply stores a per-file manual override."
+        )
+        form.addRow("Layback used", self.layback_spin)
+        layout.addLayout(form)
+
+        buttons = QHBoxLayout()
+        self.apply_layback_button = QPushButton("Apply Layback")
+        self.apply_layback_button.clicked.connect(self.apply_manual_layback)
+        self.use_file_layback_button = QPushButton("Use File Value")
+        self.use_file_layback_button.clicked.connect(self.use_file_layback)
+        buttons.addWidget(self.apply_layback_button)
+        buttons.addWidget(self.use_file_layback_button)
+        layout.addLayout(buttons)
+        self.layback_status_label = QLabel()
+        self.layback_status_label.setWordWrap(True)
+        layout.addWidget(self.layback_status_label)
+        self._update_layback_controls()
+        return group
+
+    @staticmethod
+    def _tow_value_text(value: float | None) -> str:
+        return "Not recorded" if value is None else f"{value:.1f} m"
+
+    def _update_layback_controls(self) -> None:
+        if not hasattr(self, "layback_spin"):
+            return
+        self.recorded_layback_label.setText(
+            self._tow_value_text(self.context.tow_data.recorded_layback_m)
+        )
+        self.recorded_cable_out_label.setText(
+            self._tow_value_text(self.context.tow_data.recorded_cable_out_m)
+        )
+        self.layback_spin.blockSignals(True)
+        active_geometry_settings = (
+            self.context.geometry_settings or self.loader_settings.geometry_settings
+        )
+        self.layback_spin.setValue(active_geometry_settings.effective_layback_m)
+        self.layback_spin.blockSignals(False)
+        self.layback_status_label.setText(self.context.layback_source)
+        self.use_file_layback_button.setEnabled(
+            self._layback_override_m is not None
+        )
+
+    def apply_manual_layback(self) -> None:
+        self._rebuild_geometry_for_layback(self.layback_spin.value())
+
+    def use_file_layback(self) -> None:
+        self._rebuild_geometry_for_layback(None)
+
+    def _rebuild_geometry_for_layback(
+        self, manual_layback_m: float | None
+    ) -> None:
+        geometry_settings, source = resolve_geometry_layback(
+            self.loader_settings.geometry_settings,
+            self.context.tow_data,
+            manual_layback_m=manual_layback_m,
+        )
+        self.apply_layback_button.setEnabled(False)
+        self.use_file_layback_button.setEnabled(False)
+        self.layback_status_label.setText("Recalculating contact and mosaic geometry…")
+        QApplication.processEvents()
+        try:
+            self.contact_dock.flush_pending_edit()
+            geometry = _prepare_file_geometry(
+                self.filepath,
+                self.sidescan_file,
+                geometry_settings,
+                self.loader_settings.output_directory,
+            )
+            profile_id = self.store.get_or_create_geometry_profile(geometry_settings)
+            self.store.mark_stale_for_profile(self.source_file_id, profile_id)
+            updated_context = replace(
+                self.context,
+                geometry=geometry,
+                geometry_profile_id=profile_id,
+                geometry_settings=geometry_settings,
+                layback_source=source,
+                layback_override_m=manual_layback_m,
+            )
+            self._apply_context(updated_context)
+            self.picker = _build_contact_picker(
+                updated_context, store=self.store, display=self.display
+            )
+            failures = 0
+            for record in self.store.list_contacts(
+                source_file_id=self.source_file_id
+            ):
+                try:
+                    coordinate = self.picker.coordinate_for_anchor(
+                        record.draft.anchor
+                    )
+                    self.store.recompute_contact(record.id, coordinate)
+                except Exception as exc:
+                    self.store.record_recompute_error(record.id, str(exc))
+                    failures += 1
+            self._save_file_gain_settings()
+            self.contact_dock.refresh()
+            self.contact_dock.set_geometry_status(
+                f"Geometry ready · layback "
+                f"{geometry_settings.effective_layback_m:.1f} m",
+                ready=True,
+            )
+            self._update_layback_controls()
+            self.refresh_chunk()
+            message = "Layback geometry updated"
+            if failures:
+                message += f"; {failures} contact(s) could not be recomputed"
+            self.statusBar().showMessage(message, 8000)
+        except Exception as exc:
+            self.layback_status_label.setText(f"Could not apply layback: {exc}")
+            self._update_layback_controls()
+        finally:
+            self.apply_layback_button.setEnabled(True)
+            self.use_file_layback_button.setEnabled(
+                self._layback_override_m is not None
+            )
 
     def _build_geotiff_export_group(self) -> QGroupBox:
         group = QGroupBox("GeoTIFF Export")
@@ -2702,14 +2907,13 @@ class QtContactPickerWindow(QMainWindow):
         form.addRow("Strategy", self.bottom_strategy_combo)
         layout.addLayout(form)
 
-        # Live-recalculate the chunk under the viewport center while tuning,
-        # same feel as the Napari editor's auto_call slider -- debounced like
-        # the gain slider so dragging the threshold doesn't fire a recompute
-        # per pixel of slider travel.
+        # Threshold and strategy describe one file-level bottom track. Apply
+        # them to the whole file after the controls settle, rather than
+        # allowing different chunks to retain different detector settings.
         self.bottom_recalc_timer = QTimer(self)
         self.bottom_recalc_timer.setSingleShot(True)
-        self.bottom_recalc_timer.setInterval(120)
-        self.bottom_recalc_timer.timeout.connect(self.recalc_bottom_current_chunk)
+        self.bottom_recalc_timer.setInterval(400)
+        self.bottom_recalc_timer.timeout.connect(self.recalc_bottom_whole_file)
         self.bottom_threshold_spin.valueChanged.connect(
             lambda _value: self.bottom_recalc_timer.start()
         )
@@ -2718,20 +2922,13 @@ class QtContactPickerWindow(QMainWindow):
         )
 
         recalc_row = QHBoxLayout()
-        self.recalc_chunk_button = QPushButton("Recalculate Current Chunk")
-        self.recalc_chunk_button.setToolTip(
-            "Re-run automatic detection for just the chunk centered in the "
-            "view, using the threshold/strategy above -- fast enough to "
-            "happen live while you tune them."
-        )
-        self.recalc_chunk_button.clicked.connect(self.recalc_bottom_current_chunk)
         self.recalc_all_button = QPushButton("Recalculate Whole File…")
         self.recalc_all_button.setToolTip(
-            "Re-run automatic threshold detection across the entire file. "
-            "Runs in the background; may take a while on a large survey."
+            "Explicitly rerun the current threshold and strategy across the "
+            "entire file. Changes to either control already do this "
+            "automatically after a short pause."
         )
         self.recalc_all_button.clicked.connect(self.recalc_bottom_whole_file)
-        recalc_row.addWidget(self.recalc_chunk_button)
         recalc_row.addWidget(self.recalc_all_button)
         layout.addLayout(recalc_row)
 
@@ -2853,22 +3050,14 @@ class QtContactPickerWindow(QMainWindow):
         )
         self._mark_bottom_line_dirty()
 
-    def recalc_bottom_current_chunk(self) -> None:
-        chunk_idx, _ = divmod(self._current_center_row(), self.preprocessor.chunk_size)
-        self.preprocessor.detect_bottom_napari(
-            chunk_idx,
-            threshold_bin=self.bottom_threshold_spin.value(),
-            bottom_strategy_choice=self.bottom_strategy_combo.currentText(),
-            add_line_width=1,
-        )
-        self.preprocessor.sync_chunked_bottom_to_flat(chunk_idx)
-        self._refresh_bottom_overlay()
-        self.bottom_status_label.setText(
-            f"Recalculated chunk {chunk_idx + 1}/{self.preprocessor.num_chunk}"
-        )
-        self._mark_bottom_line_dirty()
-
     def recalc_bottom_whole_file(self) -> None:
+        if self.bottom_worker is not None:
+            self._pending_full_bottom_recalc = True
+            self.bottom_status_label.setText(
+                "Current calculation finishing; latest threshold queued…"
+            )
+            return
+        self._pending_full_bottom_recalc = False
         threshold = self.bottom_threshold_spin.value()
         combine_both_sides = (
             self.bottom_strategy_combo.currentText()
@@ -2901,11 +3090,29 @@ class QtContactPickerWindow(QMainWindow):
         self.bottom_status_label.setText(status_message)
         worker = BottomLineRecalcWorker(processor_copy, run_algorithm)
         self.bottom_worker = worker
+        self._bottom_worker_source = self.filepath
         worker.signals.finished.connect(self._bottom_recalc_finished)
         worker.signals.failed.connect(self._bottom_recalc_failed)
         self.thread_pool.start(worker)
 
     def _bottom_recalc_finished(self, processor_copy: SidescanPreprocessor) -> None:
+        worker_source = self._bottom_worker_source
+        self.bottom_worker = None
+        self._bottom_worker_source = None
+        if self._pending_full_bottom_recalc:
+            # The user changed the threshold/strategy while this calculation
+            # was running. Discard its now-obsolete result and launch one
+            # calculation with the newest values.
+            self._pending_full_bottom_recalc = False
+            self._set_bottom_controls_enabled(True)
+            self.bottom_status_label.setText("Applying latest bottom settings…")
+            QTimer.singleShot(0, self.recalc_bottom_whole_file)
+            return
+        if worker_source != self.filepath:
+            # A file switch occurred while the worker was running. Never let
+            # an old file's arrays overwrite the newly loaded preprocessor.
+            self._set_bottom_controls_enabled(True)
+            return
         # Whole-object attribute reassignment, never in-place mutation --
         # reassignment is atomic, an in-place slice write on the array the
         # GUI thread might concurrently be reading/rendering is not.
@@ -2918,18 +3125,22 @@ class QtContactPickerWindow(QMainWindow):
         self.preprocessor.bottom_map = processor_copy.bottom_map
         self._refresh_bottom_overlay()
         self._set_bottom_controls_enabled(True)
-        self.bottom_worker = None
         self.bottom_status_label.setText("Bottom line updated")
         self._mark_bottom_line_dirty()
 
     def _bottom_recalc_failed(self, message: str) -> None:
-        self._set_bottom_controls_enabled(True)
         self.bottom_worker = None
+        self._bottom_worker_source = None
+        self._set_bottom_controls_enabled(True)
+        if self._pending_full_bottom_recalc:
+            self._pending_full_bottom_recalc = False
+            self.bottom_status_label.setText("Applying latest bottom settings…")
+            QTimer.singleShot(0, self.recalc_bottom_whole_file)
+            return
         self.bottom_status_label.setText(f"Bottom line recalculation failed: {message}")
 
     def _set_bottom_controls_enabled(self, enabled: bool) -> None:
         for widget in (
-            self.recalc_chunk_button,
             self.recalc_all_button,
             self.refine_altitude_button,
             self.edit_bottom_button,
@@ -3143,6 +3354,103 @@ class QtContactPickerWindow(QMainWindow):
         super().closeEvent(event)
 
 
+class QtContactPickerStartWindow(QMainWindow):
+    """Idle Qt workspace shown until the user selects a sonar file."""
+
+    def __init__(
+        self,
+        open_selected_file: Callable[[Path], QtContactPickerWindow],
+        *,
+        initial_directory: Path | None = None,
+    ):
+        super().__init__()
+        self._open_selected_file = open_selected_file
+        self._initial_directory = initial_directory
+        self._loaded_window: QtContactPickerWindow | None = None
+        self.setWindowTitle("SidescanTools - Contact picker (Qt raster)")
+        self.resize(1400, 820)
+
+        self.open_button = QPushButton("Open…")
+        self.open_button.setToolTip("Open a sonar file")
+        self.open_button.clicked.connect(self.open_file)
+        self.previous_file_button = QPushButton("◀ Previous file")
+        self.next_file_button = QPushButton("Next file ▶")
+        self.previous_file_button.setEnabled(False)
+        self.next_file_button.setEnabled(False)
+        self.file_position_label = QLabel("No sonar file selected")
+
+        file_nav = QHBoxLayout()
+        file_nav.addWidget(self.open_button)
+        file_nav.addSpacing(14)
+        file_nav.addWidget(self.previous_file_button)
+        file_nav.addWidget(self.next_file_button)
+        file_nav.addWidget(self.file_position_label, 1)
+
+        prompt = QLabel(
+            "Open a JSF or XTF sidescan file to display its waterfall and "
+            "enable processing, contacts, and export tools."
+        )
+        prompt.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        prompt.setWordWrap(True)
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.addLayout(file_nav)
+        central_layout.addWidget(prompt, 1)
+        self.setCentralWidget(central)
+
+        processing_dock = QDockWidget("Processing and gain", self)
+        processing_message = QLabel("Open a sonar file to enable these controls.")
+        processing_message.setWordWrap(True)
+        processing_message.setMargin(10)
+        processing_dock.setWidget(processing_message)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, processing_dock)
+
+        contacts_dock = QDockWidget("Sonar Contacts", self)
+        contact_group = QGroupBox("Contact List")
+        contact_group.setStyleSheet(
+            "QGroupBox { border: 2px solid #111; border-radius: 3px; "
+            "margin-top: 0.7em; padding-top: 0.5em; } "
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; "
+            "padding: 0 4px; }"
+        )
+        contact_layout = QVBoxLayout(contact_group)
+        contact_layout.addWidget(QLabel("No sonar file selected"))
+        contact_layout.addStretch(1)
+        contacts_dock.setWidget(contact_group)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, contacts_dock)
+        self.statusBar().showMessage("Ready — select Open… to choose a sonar file")
+
+    def open_file(self) -> None:
+        start_dir = str(self._initial_directory or "")
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open sonar file",
+            start_dir,
+            "Sidescan files (*.jsf *.xtf);;All files (*)",
+        )
+        if not filename:
+            return
+        filepath = Path(filename)
+        if filepath.suffix.casefold() not in {".jsf", ".xtf"}:
+            QMessageBox.warning(
+                self,
+                "Unsupported sonar file",
+                "Select a JSF or XTF sidescan file.",
+            )
+            return
+        self.statusBar().showMessage(f"Loading {filepath.name}…")
+        QApplication.processEvents()
+        try:
+            loaded_window = self._open_selected_file(filepath)
+        except Exception as exc:
+            QMessageBox.critical(self, "Could not open sonar file", str(exc))
+            self.statusBar().showMessage("No sonar file selected")
+            return
+        self._loaded_window = loaded_window
+        loaded_window.show()
+        self.close()
+
+
 def run_qt_contact_picker(
     filepath: str | os.PathLike | None = None,
     *,
@@ -3158,22 +3466,36 @@ def run_qt_contact_picker(
 ):
     """Open the no-OpenGL contact picker using Qt's raster paint engine.
 
-    ``filepath=None`` (the desktop-shortcut launch path, which has no
-    arguments to give it) shows an Open-file dialog immediately; returns
-    None without opening a window if the user cancels that dialog.
+    ``filepath=None`` (the desktop-shortcut launch path) opens an idle main
+    workspace. The user can then choose a file with the normal Open button.
     """
     application = QApplication.instance() or QApplication([])
 
     if filepath is None:
-        selected, _ = QFileDialog.getOpenFileName(
-            None,
-            "Open sonar file",
-            "",
-            "Sidescan files (*.jsf *.xtf);;All files (*)",
+        initial_directory = Path(work_dir) if work_dir is not None else None
+
+        def open_selected_file(selected: Path) -> QtContactPickerWindow:
+            return run_qt_contact_picker(
+                selected,
+                chunk_size=chunk_size,
+                default_threshold=default_threshold,
+                downsampling_factor=downsampling_factor,
+                work_dir=work_dir,
+                active_dB=active_dB,
+                active_hist_equal=active_hist_equal,
+                contacts_db_path=contacts_db_path,
+                geometry_settings=geometry_settings,
+                block=False,
+            )
+
+        window = QtContactPickerStartWindow(
+            open_selected_file,
+            initial_directory=initial_directory,
         )
-        if not selected:
-            return None
-        filepath = selected
+        window.show()
+        if block:
+            application.exec()
+        return window
 
     filepath = Path(filepath)
     output_directory = Path(work_dir) if work_dir is not None else filepath.parent

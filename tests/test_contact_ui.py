@@ -1,19 +1,15 @@
-from io import BytesIO
 from pathlib import Path
-
-from PIL import Image
 
 from sidescantools.contact_model import (
     Channel,
     ContactAnchor,
     ContactCoordinate,
     ContactDraft,
-    ContactThumbnail,
 )
 from sidescantools.contact_store import ContactStore
 from sidescantools.contact_ui import ContactDock
 from sidescantools.swath_geometry import GeometrySettings
-from qtpy.QtWidgets import QGroupBox
+from qtpy.QtWidgets import QLineEdit
 
 
 def create_contact(
@@ -46,18 +42,6 @@ def create_contact(
     )
 
 
-def make_thumbnail() -> ContactThumbnail:
-    buffer = BytesIO()
-    Image.new("RGB", (4, 4), color=(255, 0, 0)).save(buffer, format="PNG")
-    return ContactThumbnail(
-        image_bytes=buffer.getvalue(),
-        width_px=4,
-        height_px=4,
-        ping_radius=1,
-        sample_radius=1,
-    )
-
-
 def test_contact_dock_edits_refreshes_and_deletes(qtbot, tmp_path):
     with ContactStore(tmp_path / "contacts.sqlite") as store:
         source = store.register_source_file(
@@ -80,7 +64,7 @@ def test_contact_dock_edits_refreshes_and_deletes(qtbot, tmp_path):
         assert dock.name_edit.text() == "Target 0001"
 
         dock.name_edit.setText("Wreck candidate")
-        dock.notes_edit.setPlainText("reviewed")
+        dock.notes_edit.setText("reviewed")
         dock.save_selected()
 
         assert store.get_contact(contact.id).draft.name == "Wreck candidate"
@@ -103,11 +87,33 @@ def test_waypoint_exports_have_their_own_dark_outlined_group(qtbot, tmp_path):
         dock = ContactDock(store, source.id, export_directory=tmp_path)
         qtbot.addWidget(dock)
 
-        group = dock.findChild(QGroupBox)
-        assert group.title() == "Waypoint Export"
-        assert "border: 2px solid #111" in group.styleSheet()
-        assert dock.export_selected_button in group.findChildren(type(dock.export_selected_button))
-        assert dock.export_all_button in group.findChildren(type(dock.export_all_button))
+        assert dock.waypoint_export_group.title() == "Waypoint Export"
+        assert "border: 2px solid #111" in dock.waypoint_export_group.styleSheet()
+        assert dock.export_selected_button in dock.waypoint_export_group.findChildren(
+            type(dock.export_selected_button)
+        )
+        assert dock.export_all_button in dock.waypoint_export_group.findChildren(
+            type(dock.export_all_button)
+        )
+
+
+def test_contact_list_has_dark_outline_single_line_notes_and_no_thumbnail(
+    qtbot, tmp_path
+):
+    with ContactStore(tmp_path / "contacts.sqlite") as store:
+        source = store.register_source_file(
+            tmp_path / "survey.jsf",
+            format="jsf",
+            ping_count=10,
+            source_sample_count=9,
+        )
+        dock = ContactDock(store, source.id, export_directory=tmp_path)
+        qtbot.addWidget(dock)
+
+        assert dock.contact_list_group.title() == "Contact List"
+        assert "border: 2px solid #111" in dock.contact_list_group.styleSheet()
+        assert isinstance(dock.notes_edit, QLineEdit)
+        assert not hasattr(dock, "thumbnail_label")
 
 
 def test_contact_dock_autosaves_edit_before_switching_selection(qtbot, tmp_path):
@@ -128,7 +134,7 @@ def test_contact_dock_autosaves_edit_before_switching_selection(qtbot, tmp_path)
 
         dock.table.selectRow(0)
         assert dock.name_edit.text() == "Target 0001"
-        dock.notes_edit.setPlainText("edited but never pressed Save")
+        dock.notes_edit.setText("edited but never pressed Save")
 
         # Switching rows without an explicit Save must not discard the edit.
         dock.table.selectRow(1)
@@ -138,7 +144,7 @@ def test_contact_dock_autosaves_edit_before_switching_selection(qtbot, tmp_path)
 
         # The table itself should reflect the autosave without a manual refresh.
         dock.table.selectRow(0)
-        assert dock.notes_edit.toPlainText() == "edited but never pressed Save"
+        assert dock.notes_edit.text() == "edited but never pressed Save"
 
 
 def test_contact_dock_does_not_resave_unchanged_selection(qtbot, tmp_path):
@@ -186,32 +192,6 @@ def test_refresh_and_focus_name_selects_the_default_name(qtbot, tmp_path):
         qtbot.waitUntil(lambda: dock.name_edit.hasFocus(), timeout=2000)
 
 
-def test_contact_dock_shows_and_clears_thumbnail(qtbot, tmp_path):
-    with ContactStore(tmp_path / "contacts.sqlite") as store:
-        source = store.register_source_file(
-            tmp_path / "survey.jsf",
-            format="jsf",
-            ping_count=10,
-            source_sample_count=9,
-        )
-        profile_id = store.get_or_create_geometry_profile(GeometrySettings(60))
-        create_contact(store, source.id, profile_id, thumbnail=make_thumbnail())
-        create_contact(
-            store, source.id, profile_id, global_ping_index=6, name="Target 0002"
-        )
-        dock = ContactDock(store, source.id, export_directory=tmp_path)
-        qtbot.addWidget(dock)
-
-        dock.table.selectRow(0)
-        assert not dock.thumbnail_label.pixmap().isNull()
-
-        dock.table.selectRow(1)
-        # PyQt5 returns None (not a null QPixmap) from QLabel.pixmap() once cleared.
-        cleared_pixmap = dock.thumbnail_label.pixmap()
-        assert cleared_pixmap is None or cleared_pixmap.isNull()
-        assert dock.thumbnail_label.text() == "No thumbnail"
-
-
 def test_discard_pending_edit_drops_unsaved_changes_without_saving(qtbot, tmp_path):
     # Used right before a database is about to be destroyed (e.g. "New
     # Database" overwriting the file currently open) -- flushing a pending
@@ -226,7 +206,7 @@ def test_discard_pending_edit_drops_unsaved_changes_without_saving(qtbot, tmp_pa
         dock = ContactDock(store, source.id, export_directory=tmp_path)
         qtbot.addWidget(dock)
         dock.table.selectRow(0)
-        dock.notes_edit.setPlainText("typed but never saved")
+        dock.notes_edit.setText("typed but never saved")
 
         dock.discard_pending_edit()
 
@@ -256,7 +236,7 @@ def test_set_source_file_autosaves_pending_edit_then_switches_scope(qtbot, tmp_p
         dock = ContactDock(store, source_a.id, export_directory=tmp_path)
         qtbot.addWidget(dock)
         dock.table.selectRow(0)
-        dock.notes_edit.setPlainText("edited on file A, never pressed Save")
+        dock.notes_edit.setText("edited on file A, never pressed Save")
 
         dock.set_source_file(source_b.id)
 
@@ -291,7 +271,7 @@ def test_set_store_autosaves_then_switches_to_a_different_database(qtbot, tmp_pa
         dock = ContactDock(store_a, source_a.id, export_directory=tmp_path)
         qtbot.addWidget(dock)
         dock.table.selectRow(0)
-        dock.notes_edit.setPlainText("edited in database A, never pressed Save")
+        dock.notes_edit.setText("edited in database A, never pressed Save")
 
         dock.set_store(store_b, source_b.id)
 

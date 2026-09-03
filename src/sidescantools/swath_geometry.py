@@ -27,6 +27,7 @@ class GeometrySettings:
     y_offset_m: float = 0.0
     navigation_smoothing_version: str = "legacy-v1"
     geometry_algorithm_version: int = 1
+    layback_m: float | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -42,6 +43,16 @@ class GeometrySettings:
                 raise ValueError(f"{name} must be finite")
             object.__setattr__(self, name, float(value))
 
+        if self.layback_m is not None:
+            if (
+                isinstance(self.layback_m, bool)
+                or not isinstance(self.layback_m, (int, float))
+                or not math.isfinite(self.layback_m)
+                or self.layback_m < 0
+            ):
+                raise ValueError("layback_m must be a finite nonnegative number")
+            object.__setattr__(self, "layback_m", float(self.layback_m))
+
         if not isinstance(self.navigation_smoothing_version, str) or not (
             self.navigation_smoothing_version.strip()
         ):
@@ -56,13 +67,27 @@ class GeometrySettings:
     def to_json(self) -> str:
         """Serialize deterministically for persistence and stale detection."""
 
+        values = asdict(self)
+        # Preserve the hashes of pre-layback geometry profiles when no direct
+        # layback is in use. This avoids making every existing contact stale
+        # merely because the optional field was introduced.
+        if values["layback_m"] is None:
+            del values["layback_m"]
         return json.dumps(
-            asdict(self),
+            values,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
             allow_nan=False,
         )
+
+    @property
+    def effective_layback_m(self) -> float:
+        """Direct layback, or the legacy 45-degree cable-out estimate."""
+
+        if self.layback_m is not None:
+            return self.layback_m
+        return math.sin(math.radians(45.0)) * self.cable_out_m
 
     @property
     def settings_hash(self) -> str:

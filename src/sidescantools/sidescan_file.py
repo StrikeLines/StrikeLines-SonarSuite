@@ -9,6 +9,38 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 
+def _finite_or_nan(value) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return value if np.isfinite(value) else float("nan")
+
+
+def xtf_tow_data(packet) -> tuple[float, float]:
+    """Return XTF direct layback and cable-out values in meters."""
+
+    layback_m = _finite_or_nan(getattr(packet, "Layback", np.nan))
+    cable_out_m = _finite_or_nan(getattr(packet, "CableOut", np.nan))
+    hundredths = _finite_or_nan(getattr(packet, "CableOutHundredths", 0.0))
+    if np.isfinite(cable_out_m) and np.isfinite(hundredths):
+        cable_out_m += hundredths / 100.0
+    return layback_m, cable_out_m
+
+
+def jsf_tow_data(message) -> tuple[float, float]:
+    """Return JSF direct layback and valid cable counter in meters."""
+
+    layback_m = _finite_or_nan(getattr(message, "layback", np.nan))
+    validity = int(getattr(message, "validity", 0))
+    cable_out_m = float("nan")
+    if validity & (1 << 11):
+        raw_cable_out = _finite_or_nan(getattr(message, "cable_out", np.nan))
+        if np.isfinite(raw_cable_out):
+            cable_out_m = raw_cable_out / 10.0
+    return layback_m, cable_out_m
+
+
 class SidescanFile:
     """Wrapper to read sidescan files.
     Format definition: https://www.exail.com/media-file/9742/xtf-file-format-specification-rev42.pdf
@@ -107,6 +139,8 @@ class SidescanFile:
             self.packet_no = np.empty(self.num_ping)
             self.seconds_per_ping = np.empty((self.num_ch, self.num_ping))
             self.slant_range = np.empty((self.num_ch, self.num_ping))
+            self.layback_m = np.full(self.num_ping, np.nan)
+            self.cable_out_m = np.full(self.num_ping, np.nan)
 
             # not included
             self.starting_depth = np.zeros(self.num_ping)
@@ -114,8 +148,12 @@ class SidescanFile:
 
             # read XTF info
             for p_idx in range(self.num_ping):
+                ping_packet = xtf.packets[pyxtf.XTFHeaderType.sonar][p_idx]
+                self.layback_m[p_idx], self.cable_out_m[p_idx] = xtf_tow_data(
+                    ping_packet
+                )
                 self.sound_velocity[p_idx] = (
-                    xtf.packets[pyxtf.XTFHeaderType.sonar][p_idx].SoundVelocity * 2
+                    ping_packet.SoundVelocity * 2
                 )  # half SOS in water
                 self.timestamp[p_idx] = datetime(
                     xtf.packets[pyxtf.XTFHeaderType.sonar][p_idx].Year,
@@ -267,6 +305,8 @@ class SidescanFile:
             self.packet_no = np.empty(self.num_ping)
             self.seconds_per_ping = np.empty((self.num_ch, self.num_ping))
             self.slant_range = np.empty((self.num_ch, self.num_ping))
+            self.layback_m = np.full(self.num_ping, np.nan)
+            self.cable_out_m = np.full(self.num_ping, np.nan)
 
             # not included
             self.sensor_aux_altitude = np.zeros(self.num_ping)
@@ -298,6 +338,10 @@ class SidescanFile:
                         )
                         self.sensor_roll[p_idx] = packet.message.roll / 32768 * 180
                         self.sensor_speed[p_idx] = packet.message.speed / 10 / 1.944
+                        (
+                            self.layback_m[p_idx],
+                            self.cable_out_m[p_idx],
+                        ) = jsf_tow_data(packet.message)
 
                         self.depth[p_idx] = packet.message.depth / 1e3
                         # JSF ``packet_no`` counts packets within one ping and is

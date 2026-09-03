@@ -27,6 +27,7 @@ def _settings(**changes):
         "egn_table_path": "tables/survey.npz",
         "destripe_active": True,
         "slant_range_correction_active": True,
+        "layback_override_m": 42.5,
     }
     values.update(changes)
     return SonarGainSettings(**values)
@@ -45,6 +46,7 @@ def test_gain_settings_round_trip_as_versioned_json(tmp_path):
     assert raw["processing"]["mode"] == "egn"
     assert raw["processing"]["destripe_active"] is True
     assert raw["processing"]["slant_range_correction_active"] is True
+    assert raw["geometry"]["layback_override_m"] == 42.5
     assert raw["display"]["auto_tvg_gain_db"] == [-1.25, 0.0, 2.5, 1.0]
     assert list(tmp_path.glob("*.tmp")) == []
 
@@ -59,12 +61,14 @@ def test_older_sidecar_without_optional_processing_fields_loads_disabled(tmp_pat
     values = _settings(destripe_active=False).to_dict()
     del values["processing"]["destripe_active"]
     del values["processing"]["slant_range_correction_active"]
+    del values["geometry"]
     path.write_text(json.dumps(values), encoding="utf-8")
 
     loaded = load_gain_settings(sonar_path)
 
     assert loaded.destripe_active is False
     assert loaded.slant_range_correction_active is False
+    assert loaded.layback_override_m is None
 
 
 def test_gain_settings_cannot_be_attached_to_a_different_sonar_file(tmp_path):
@@ -79,6 +83,8 @@ def test_gain_settings_reject_invalid_batch_inputs():
         _settings(auto_tvg_brightness_target_percent=0)
     with pytest.raises(ValueError, match="finite"):
         _settings(overall_gain_db=float("nan"))
+    with pytest.raises(ValueError, match="layback_override_m"):
+        _settings(layback_override_m=-1)
 
 
 def test_egn_paths_are_portable_and_resolve_from_the_sonar_directory(tmp_path):
