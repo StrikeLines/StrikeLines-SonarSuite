@@ -9,6 +9,7 @@ from qtpy.QtGui import QPixmap
 from qtpy.QtWidgets import (
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -144,21 +145,28 @@ class ContactDock(QWidget):
         self.delete_button.clicked.connect(self.delete_selected)
         self.export_selected_button.clicked.connect(self.export_selected)
         self.export_all_button.clicked.connect(self.export_all)
-        buttons = QHBoxLayout()
-        for button in (
-            self.save_button,
-            self.delete_button,
-            self.export_selected_button,
-            self.export_all_button,
-        ):
-            buttons.addWidget(button)
+        editor_buttons = QHBoxLayout()
+        editor_buttons.addWidget(self.save_button)
+        editor_buttons.addWidget(self.delete_button)
+
+        self.waypoint_export_group = QGroupBox("Waypoint Export")
+        self.waypoint_export_group.setStyleSheet(
+            "QGroupBox { border: 2px solid #111; border-radius: 3px; "
+            "margin-top: 0.7em; padding-top: 0.5em; } "
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; "
+            "padding: 0 4px; }"
+        )
+        waypoint_buttons = QHBoxLayout(self.waypoint_export_group)
+        waypoint_buttons.addWidget(self.export_selected_button)
+        waypoint_buttons.addWidget(self.export_all_button)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.status)
         layout.addWidget(self.table)
         layout.addWidget(self.thumbnail_label)
         layout.addLayout(form)
-        layout.addLayout(buttons)
+        layout.addLayout(editor_buttons)
+        layout.addWidget(self.waypoint_export_group)
         self._set_editor_enabled(False)
 
     def selected_record(self):

@@ -3,7 +3,8 @@
 
 > This repository is a Windows-compatible fork of
 > [sonoware/sidescantools](https://github.com/sonoware/sidescantools). It adds a Qt raster workspace for digitizing contacts,
-> exporting contacts, bottom-line editing, and interactive gain adjustment.
+> exporting contacts and GeoTIFFs, bottom-line editing, and interactive sonar
+> processing and gain adjustment.
 
 ## What this fork adds
 
@@ -24,9 +25,16 @@
   equalizes typical brightness across port and starboard, raises dark regions,
   reduces blown-out regions, and uses a user-selectable brightness target
   (30% by default) with an overall gain baseline of approximately -10 dB.
-- **Focused processing controls.** Switch the display between the raw waterfall
-  and Empirical Gain Normalization (EGN) data. The Qt workflow also includes EGN
+- **Focused processing controls.** Switch between the raw waterfall and
+  Empirical Gain Normalization (EGN), suppress roll-related striping with the
+  destripe filter, and apply slant-range correction to remove the water column
+  using the tracked bottom as the new nadir. The Qt workflow also includes EGN
   table selection and a multi-file EGN table builder.
+- **Fast GIS-ready GeoTIFF export.** Export the open sonar file or batch-export
+  every JSF/XTF file in a directory directly from the Qt workspace. Outputs are
+  written beside each source file with matching basenames and can use WGS 84
+  (EPSG:4326) or Web Mercator (EPSG:3857). Saved TVG, EGN, destripe, and
+  slant-range settings are applied so exported colors match the waterfall.
 - **New bottom-line workflow.** View and edit the bottom line directly over the
   continuous waterfall. Automatic bottom-line detection and manual tracing are
   available. Changes auto-save beside the sonar file as `<name>_bottom_info.npz`.
@@ -91,10 +99,11 @@ list. On Windows, `--viewer auto` also selects the Qt viewer automatically.
 The Qt picker automatically writes a versioned JSON sidecar named
 `<sonar_filename>.tvg_gain.cfg` beside every opened JSF/XTF file. It restores
 that file's overall gain, TVG spreading and absorption, Auto TVG target and
-fitted correction, Speed Correction, Raw/EGN mode, and EGN table path the next
-time the sonar file is opened. The format is implemented independently of Qt
-in `sidescantools.gain_settings` so batch GeoTIFF and mosaicking workflows can
-load the same settings directly.
+fitted correction, Speed Correction, Raw/EGN mode, EGN table path, destripe
+state, and slant-range correction state the next time the sonar file is opened.
+The format is implemented independently of Qt in
+`sidescantools.gain_settings` so batch GeoTIFF and mosaicking workflows can load
+the same settings directly.
 
 ## Start the original workflows
 

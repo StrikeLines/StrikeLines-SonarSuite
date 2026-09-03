@@ -69,6 +69,12 @@ from sidescantools.gain_settings import (
     save_gain_settings,
 )
 from sidescantools.georef_thread import Georeferencer
+from sidescantools.geotiff_export import (
+    PreparedSonarExport,
+    export_prepared_waterfall,
+    export_sonar_file,
+    geotiff_output_path,
+)
 from sidescantools.interaction_mode import InteractionMode, InteractionModeController
 from sidescantools.sidescan_file import SidescanFile
 from sidescantools.sidescan_preproc import SidescanPreprocessor
@@ -100,6 +106,85 @@ class GainProcessingWorker(QRunnable):
             self.signals.failed.emit(str(exc))
             return
         self.signals.finished.emit(result)
+
+
+class GeoTiffExportSignals(QObject):
+    progress = Signal(int, str)
+    finished = Signal(object, object)
+
+
+class GeoTiffExportWorker(QRunnable):
+    """Export one prepared file or a directory batch off the GUI thread."""
+
+    def __init__(
+        self,
+        files: list[Path],
+        *,
+        epsg: int,
+        loader_settings,
+        overwrite: bool,
+        prepared_current: PreparedSonarExport | None = None,
+    ):
+        super().__init__()
+        self.files = [Path(path).resolve() for path in files]
+        self.epsg = int(epsg)
+        self.loader_settings = loader_settings
+        self.overwrite = overwrite
+        self.prepared_current = prepared_current
+        self.signals = GeoTiffExportSignals()
+
+    def run(self) -> None:
+        results = []
+        failures = []
+        total = len(self.files)
+        for file_index, source in enumerate(self.files):
+            def report(file_percent: int, message: str) -> None:
+                overall = int(
+                    ((file_index + max(0, min(100, file_percent)) / 100.0) / total)
+                    * 100
+                )
+                self.signals.progress.emit(
+                    overall, f"{source.name}: {message}"
+                )
+
+            try:
+                if self.prepared_current is not None and total == 1:
+                    result = export_prepared_waterfall(
+                        source,
+                        self.prepared_current.rgb,
+                        self.prepared_current.geometry_by_channel,
+                        epsg=self.epsg,
+                        pipeline_description=(
+                            self.prepared_current.pipeline_description
+                        ),
+                        overwrite=self.overwrite,
+                        progress=report,
+                    )
+                else:
+                    result = export_sonar_file(
+                        source,
+                        epsg=self.epsg,
+                        chunk_size=self.loader_settings.chunk_size,
+                        default_threshold=(
+                            self.loader_settings.default_threshold
+                        ),
+                        downsampling_factor=(
+                            self.loader_settings.downsampling_factor
+                        ),
+                        active_db=self.loader_settings.active_dB,
+                        active_hist_equal=(
+                            self.loader_settings.active_hist_equal
+                        ),
+                        geometry_settings=(
+                            self.loader_settings.geometry_settings
+                        ),
+                        overwrite=self.overwrite,
+                        progress=report,
+                    )
+                results.append(result)
+            except Exception as exc:
+                failures.append((source, str(exc)))
+        self.signals.finished.emit(results, failures)
 
 
 def _copy_preprocessor_for_bottom_line(
@@ -1423,6 +1508,7 @@ class QtContactPickerWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self.processing_worker = None
         self.bottom_worker = None
+        self.geotiff_worker = None
         self._restoring_gain_settings = False
         self._pending_restored_gain_settings = None
         self.gain_settings_save_timer = QTimer(self)
@@ -1598,6 +1684,7 @@ class QtContactPickerWindow(QMainWindow):
         contacts_panel_layout.addLayout(database_row)
         contacts_panel_layout.addWidget(self.database_label)
         contacts_panel_layout.addWidget(self.contact_dock, 1)
+        contacts_panel_layout.addWidget(self._build_geotiff_export_group())
 
         dock = QDockWidget("Sonar Contacts", self)
         dock.setWidget(contacts_panel)
@@ -1609,6 +1696,9 @@ class QtContactPickerWindow(QMainWindow):
         bottom_line_dock.setWidget(self._build_bottom_line_panel())
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, bottom_line_dock)
         self.tabifyDockWidget(processing_dock, bottom_line_dock)
+        # tabifyDockWidget normally leaves the most recently added dock on
+        # top. Processing and Gain is the primary startup workflow.
+        processing_dock.raise_()
         self._connect_gain_settings_autosave()
         gain_settings_notice = self._restore_file_gain_settings()
         self.contact_dock.contact_deleted.connect(self.refresh_chunk)
@@ -1716,6 +1806,10 @@ class QtContactPickerWindow(QMainWindow):
             speed_correction_px_per_ping=self.along_track_spin.value(),
             processing_mode=str(self.processing_mode.currentData()),
             egn_table_path=portable_egn_table_path(egn_path, self.filepath),
+            destripe_active=self.destripe_button.isChecked(),
+            slant_range_correction_active=(
+                self.slant_range_checkbox.isChecked()
+            ),
         )
 
     def _save_file_gain_settings(self) -> bool:
@@ -1753,6 +1847,8 @@ class QtContactPickerWindow(QMainWindow):
             f"{self.display.normalize_target_percent}%…"
         )
         self.egn_path.clear()
+        self.destripe_button.setChecked(False)
+        self.slant_range_checkbox.setChecked(False)
         raw_index = self.processing_mode.findData(BuiltInGainMode.RAW.value)
         self.processing_mode.setCurrentIndex(raw_index)
 
@@ -1776,6 +1872,10 @@ class QtContactPickerWindow(QMainWindow):
         )
         egn_path = resolve_egn_table_path(settings, self.filepath)
         self.egn_path.setText(str(egn_path) if egn_path is not None else "")
+        self.destripe_button.setChecked(settings.destripe_active)
+        self.slant_range_checkbox.setChecked(
+            settings.slant_range_correction_active
+        )
         mode_index = self.processing_mode.findData(settings.processing_mode)
         if mode_index < 0:
             raise ValueError(
@@ -1807,11 +1907,15 @@ class QtContactPickerWindow(QMainWindow):
                     raise ValueError(
                         "saved source filename does not match the sonar file"
                     )
-                is_egn = settings.processing_mode == BuiltInGainMode.EGN.value
-                self._apply_file_gain_settings(
-                    settings, restore_auto_tvg=not is_egn
+                needs_processing = (
+                    settings.processing_mode == BuiltInGainMode.EGN.value
+                    or settings.destripe_active
+                    or settings.slant_range_correction_active
                 )
-                if is_egn:
+                self._apply_file_gain_settings(
+                    settings, restore_auto_tvg=not needs_processing
+                )
+                if needs_processing:
                     self._pending_restored_gain_settings = settings
         except Exception as exc:
             self._reset_file_gain_settings()
@@ -1822,7 +1926,11 @@ class QtContactPickerWindow(QMainWindow):
         if settings is None:
             if not self._save_file_gain_settings():
                 return f"Could not create {settings_path.name}"
-        elif settings.processing_mode == BuiltInGainMode.EGN.value:
+        elif (
+            settings.processing_mode == BuiltInGainMode.EGN.value
+            or settings.destripe_active
+            or settings.slant_range_correction_active
+        ):
             QTimer.singleShot(0, self.apply_builtin_processing)
         return None
 
@@ -1942,6 +2050,201 @@ class QtContactPickerWindow(QMainWindow):
         self._update_status(f"Opened {filepath.name}")
         if gain_settings_notice:
             self.statusBar().showMessage(gain_settings_notice, 8000)
+
+    def _build_geotiff_export_group(self) -> QGroupBox:
+        group = QGroupBox("GeoTIFF Export")
+        self._emphasize_sidebar_group(group)
+        layout = QVBoxLayout(group)
+        crs_row = QFormLayout()
+        self.geotiff_crs = QComboBox()
+        self.geotiff_crs.addItem("WGS 84 (EPSG:4326)", 4326)
+        self.geotiff_crs.addItem("Web Mercator (EPSG:3857)", 3857)
+        self.geotiff_crs.setToolTip(
+            "Choose the coordinate reference system embedded in the output raster."
+        )
+        crs_row.addRow("Output CRS", self.geotiff_crs)
+        layout.addLayout(crs_row)
+
+        self.export_current_geotiff_button = QPushButton("Export Current File")
+        self.export_current_geotiff_button.setMinimumHeight(36)
+        self.export_current_geotiff_button.setToolTip(
+            "Export the open waterfall beside its source sonar file, using "
+            "the currently displayed processing, TVG, and colors."
+        )
+        self.export_current_geotiff_button.clicked.connect(
+            self.export_current_geotiff
+        )
+        self.export_directory_geotiff_button = QPushButton(
+            "Batch Export Directory…"
+        )
+        self.export_directory_geotiff_button.setMinimumHeight(36)
+        self.export_directory_geotiff_button.setToolTip(
+            "Export every .jsf/.xtf file in one folder using each file's own "
+            ".tvg_gain.cfg sidecar."
+        )
+        self.export_directory_geotiff_button.clicked.connect(
+            self.export_geotiff_directory
+        )
+        layout.addWidget(self.export_current_geotiff_button)
+        layout.addWidget(self.export_directory_geotiff_button)
+
+        self.geotiff_progress = QProgressBar()
+        self.geotiff_progress.setRange(0, 100)
+        self.geotiff_progress.setValue(0)
+        self.geotiff_status = QLabel(
+            "Outputs are saved beside each source file as <basename>.tif."
+        )
+        self.geotiff_status.setWordWrap(True)
+        layout.addWidget(self.geotiff_progress)
+        layout.addWidget(self.geotiff_status)
+        return group
+
+    def export_current_geotiff(self) -> None:
+        if self.processing_worker is not None:
+            QMessageBox.warning(
+                self,
+                "Processing still running",
+                "Wait for waterfall processing to finish before exporting.",
+            )
+            return
+        # Write even if the debounce timer is idle: the file on disk becomes
+        # the durable record of the exact display being exported.
+        self.gain_settings_save_timer.stop()
+        if not self._save_file_gain_settings():
+            QMessageBox.warning(
+                self,
+                "Could not save settings",
+                "GeoTIFF export was not started because the TVG settings "
+                "sidecar could not be saved.",
+            )
+            return
+        destination = geotiff_output_path(self.filepath)
+        overwrite = self._confirm_geotiff_overwrite([destination])
+        if overwrite is None:
+            return
+        prepared = PreparedSonarExport(
+            rgb=np.array(self.display.render_rgb(), copy=True),
+            geometry_by_channel=dict(self.context.geometry),
+            pipeline_description=self.display.pipeline_description,
+        )
+        self._start_geotiff_export(
+            [self.filepath],
+            overwrite=overwrite,
+            prepared_current=prepared,
+        )
+
+    def export_geotiff_directory(self) -> None:
+        # If the open file is part of this batch, do not let a pending slider
+        # edit miss the sidecar snapshot the worker is about to load.
+        self._flush_pending_gain_settings_save()
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Choose sonar directory to batch export",
+            str(self.filepath.parent),
+        )
+        if not directory:
+            return
+        files = sonar_files_in_directory(directory)
+        if not files:
+            QMessageBox.information(
+                self,
+                "No sonar files",
+                "The selected directory contains no .jsf or .xtf files.",
+            )
+            return
+
+        destinations: dict[str, list[Path]] = {}
+        for source in files:
+            output = geotiff_output_path(source)
+            destinations.setdefault(output.name.casefold(), []).append(source)
+        collisions = [sources for sources in destinations.values() if len(sources) > 1]
+        if collisions:
+            names = ", ".join(source.name for source in collisions[0])
+            QMessageBox.warning(
+                self,
+                "Duplicate output basename",
+                f"These files would write the same GeoTIFF name: {names}",
+            )
+            return
+
+        overwrite = self._confirm_geotiff_overwrite(
+            [geotiff_output_path(source) for source in files]
+        )
+        if overwrite is None:
+            return
+        self._start_geotiff_export(files, overwrite=overwrite)
+
+    def _confirm_geotiff_overwrite(self, destinations: list[Path]) -> bool | None:
+        existing = [path for path in destinations if path.exists()]
+        if not existing:
+            return False
+        noun = existing[0].name if len(existing) == 1 else f"{len(existing)} GeoTIFFs"
+        answer = QMessageBox.question(
+            self,
+            "Replace existing GeoTIFF?",
+            f"{noun} already exist. Replace the existing output?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return True if answer == QMessageBox.StandardButton.Yes else None
+
+    def _start_geotiff_export(
+        self,
+        files: list[Path],
+        *,
+        overwrite: bool,
+        prepared_current: PreparedSonarExport | None = None,
+    ) -> None:
+        if self.geotiff_worker is not None:
+            QMessageBox.information(
+                self, "Export in progress", "A GeoTIFF export is already running."
+            )
+            return
+        self.export_current_geotiff_button.setEnabled(False)
+        self.export_directory_geotiff_button.setEnabled(False)
+        self.geotiff_crs.setEnabled(False)
+        self.geotiff_progress.setValue(0)
+        self.geotiff_status.setText(
+            f"Starting export of {len(files)} sonar file(s)…"
+        )
+        worker = GeoTiffExportWorker(
+            files,
+            epsg=int(self.geotiff_crs.currentData()),
+            loader_settings=self.loader_settings,
+            overwrite=overwrite,
+            prepared_current=prepared_current,
+        )
+        self.geotiff_worker = worker
+        worker.signals.progress.connect(self._geotiff_export_progressed)
+        worker.signals.finished.connect(self._geotiff_export_finished)
+        self.thread_pool.start(worker)
+
+    def _geotiff_export_progressed(self, percent: int, message: str) -> None:
+        self.geotiff_progress.setValue(percent)
+        self.geotiff_status.setText(message)
+
+    def _geotiff_export_finished(self, results: list, failures: list) -> None:
+        self.export_current_geotiff_button.setEnabled(True)
+        self.export_directory_geotiff_button.setEnabled(True)
+        self.geotiff_crs.setEnabled(True)
+        self.geotiff_worker = None
+        if results:
+            self.geotiff_progress.setValue(100)
+        default_count = sum(result.used_default_settings for result in results)
+        message = f"Exported {len(results)} GeoTIFF(s)"
+        if default_count:
+            message += f"; {default_count} used default settings (no sidecar found)"
+        if failures:
+            message += f"; {len(failures)} failed"
+        self.geotiff_status.setText(message)
+        self.statusBar().showMessage(message, 10000)
+        if failures:
+            details = "\n".join(
+                f"{path.name}: {error}" for path, error in failures[:8]
+            )
+            if len(failures) > 8:
+                details += f"\n…and {len(failures) - 8} more"
+            QMessageBox.warning(self, "GeoTIFF export incomplete", details)
 
     def _update_database_label(self) -> None:
         self.database_label.setText(f"Database: {self.contacts_db_path.name}")
@@ -2120,6 +2423,35 @@ class QtContactPickerWindow(QMainWindow):
         view_layout.addWidget(self.reset_view_button)
         layout.addWidget(view_group)
 
+        slant_group = QGroupBox("Slant Range Correction")
+        self._emphasize_sidebar_group(slant_group)
+        slant_layout = QVBoxLayout(slant_group)
+        self.slant_range_checkbox = QCheckBox("Apply Slant Range Correction")
+        self.slant_range_checkbox.setMinimumHeight(30)
+        self.slant_range_checkbox.setToolTip(
+            "Remove the water column and project each side onto ground range, "
+            "using the saved bottom-tracking line as the new nadir. This "
+            "setting also applies to GeoTIFF exports."
+        )
+        self.slant_range_checkbox.clicked.connect(self.apply_builtin_processing)
+        slant_layout.addWidget(self.slant_range_checkbox)
+        layout.addWidget(slant_group)
+
+        destripe_group = QGroupBox("Destripe Filter")
+        self._emphasize_sidebar_group(destripe_group)
+        destripe_layout = QVBoxLayout(destripe_group)
+        self.destripe_button = QPushButton("Apply Destripe Filter")
+        self.destripe_button.setCheckable(True)
+        self.destripe_button.setMinimumHeight(36)
+        self.destripe_button.setToolTip(
+            "Suppress horizontal brightness stripes caused by small changes "
+            "in towfish roll. Checked means the filter is active for this "
+            "sonar file and for its GeoTIFF export."
+        )
+        self.destripe_button.clicked.connect(self.apply_builtin_processing)
+        destripe_layout.addWidget(self.destripe_button)
+        layout.addWidget(destripe_group)
+
         egn_group = QGroupBox("EGN Settings & Options")
         self._emphasize_sidebar_group(egn_group)
         egn_layout = QVBoxLayout(egn_group)
@@ -2250,6 +2582,8 @@ class QtContactPickerWindow(QMainWindow):
         self.egn_path.setText(filename)
 
     def apply_builtin_processing(self) -> None:
+        if self.processing_worker is not None:
+            return
         try:
             mode = BuiltInGainMode(self.processing_mode.currentData())
             egn_path = (
@@ -2261,12 +2595,18 @@ class QtContactPickerWindow(QMainWindow):
                 mode=mode,
                 egn_table_path=egn_path,
                 nadir_angle=egn_table_nadir_angle(egn_path),
+                destripe=self.destripe_button.isChecked(),
+                slant_range_correction=(
+                    self.slant_range_checkbox.isChecked()
+                ),
             )
         except Exception as exc:
             self.processing_status.setText(str(exc))
             return
 
         self.apply_processing_button.setEnabled(False)
+        self.destripe_button.setEnabled(False)
+        self.slant_range_checkbox.setEnabled(False)
         self.processing_progress.setValue(0)
         self.processing_status.setText("Starting processing…")
         worker = GainProcessingWorker(self.built_in_processor, request)
@@ -2299,12 +2639,15 @@ class QtContactPickerWindow(QMainWindow):
             finally:
                 self._restoring_gain_settings = False
         self.view.set_image(self.display.render_rgb())
+        self._refresh_bottom_overlay()
         self.processing_progress.setValue(100)
         self.processing_status.setText(
             restore_warning
             or "Active: " + result.pipeline_description.replace("|", " · ")
         )
         self.apply_processing_button.setEnabled(True)
+        self.destripe_button.setEnabled(True)
+        self.slant_range_checkbox.setEnabled(True)
         self.processing_worker = None
         self._schedule_gain_settings_save()
         self._update_status()
@@ -2313,6 +2656,8 @@ class QtContactPickerWindow(QMainWindow):
         self._pending_restored_gain_settings = None
         self.processing_status.setText(f"Processing failed: {message}")
         self.apply_processing_button.setEnabled(True)
+        self.destripe_button.setEnabled(True)
+        self.slant_range_checkbox.setEnabled(True)
         self.processing_worker = None
 
     def show_raw_waterfall(self) -> None:
@@ -2321,10 +2666,13 @@ class QtContactPickerWindow(QMainWindow):
             self.raw_waterfall,
             base_pipeline="qt-continuous-waterfall-v1|raw",
         )
+        self.destripe_button.setChecked(False)
+        self.slant_range_checkbox.setChecked(False)
         self.processing_mode.setCurrentIndex(0)
         self.processing_progress.setValue(0)
         self.processing_status.setText("Raw display")
         self.view.set_image(self.display.render_rgb())
+        self._refresh_bottom_overlay()
         self._schedule_gain_settings_save()
         self._update_status()
 
@@ -2467,6 +2815,11 @@ class QtContactPickerWindow(QMainWindow):
 
     def _refresh_bottom_overlay(self) -> None:
         mask = logical_bottom_overlay(self.preprocessor, self.sidescan_file.num_ping)
+        # Slant-range correction collapses the tracked bottom onto the new
+        # nadir. The original red tracking line would otherwise be drawn at
+        # stale acoustic-sample positions over the corrected seabed.
+        if self.slant_range_checkbox.isChecked():
+            mask = np.zeros_like(mask)
         self.view.set_bottom_overlay(mask)
 
     def _apply_bottom_edit(self, row: int, column: int) -> None:

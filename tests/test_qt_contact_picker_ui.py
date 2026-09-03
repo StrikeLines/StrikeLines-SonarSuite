@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from qtpy.QtCore import QEvent, QObject, QPoint, QRunnable, Qt, QTimer, Signal
 from qtpy.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QGraphicsItem,
     QGraphicsView,
@@ -76,6 +77,31 @@ def test_logical_bottom_overlay_uses_the_same_reshape_as_logical_waterfall():
     np.testing.assert_array_equal(result, np.arange(20).reshape(5, 4))
 
 
+def test_slant_range_view_suppresses_and_then_restores_bottom_overlay(qtbot):
+    checkbox = QCheckBox()
+    qtbot.addWidget(checkbox)
+    captured = []
+    window = SimpleNamespace(
+        preprocessor=SimpleNamespace(
+            ping_len=2,
+            bottom_map=np.ones((1, 2, 4)),
+        ),
+        sidescan_file=SimpleNamespace(num_ping=2),
+        slant_range_checkbox=checkbox,
+        view=SimpleNamespace(
+            set_bottom_overlay=lambda mask: captured.append(np.array(mask, copy=True))
+        ),
+    )
+
+    checkbox.setChecked(True)
+    QtContactPickerWindow._refresh_bottom_overlay(window)
+    checkbox.setChecked(False)
+    QtContactPickerWindow._refresh_bottom_overlay(window)
+
+    assert not np.any(captured[0])
+    assert np.all(captured[1] == 1)
+
+
 def test_requested_gain_and_scale_defaults_are_applied(qtbot):
     model = WaterfallGainModel(np.full((2, 6), 0.1), slant_range_m=10.0)
     view = WaterfallView()
@@ -144,12 +170,14 @@ def test_processing_panel_starts_with_gain_and_view_controls(qtbot, tmp_path):
     groups = panel.findChildren(
         QGroupBox, options=Qt.FindChildOption.FindDirectChildrenOnly
     )
-    assert [group.title() for group in groups[:3]] == [
+    assert [group.title() for group in groups[:5]] == [
         "Gain & TVG",
         "View",
+        "Slant Range Correction",
+        "Destripe Filter",
         "EGN Settings & Options",
     ]
-    assert all("border: 2px solid" in group.styleSheet() for group in groups[:3])
+    assert all("border: 2px solid" in group.styleSheet() for group in groups[:5])
     assert window.gain_slider.maximum() == 20
     assert window.tvg_spreading_slider.maximum() == 34
     assert window.tvg_absorption_slider.maximum() == 20  # fixed-point 0.20
@@ -159,6 +187,10 @@ def test_processing_panel_starts_with_gain_and_view_controls(qtbot, tmp_path):
     assert "Speed Correction" in " ".join(
         label.text() for label in groups[1].findChildren(QLabel)
     )
+    assert window.slant_range_checkbox.text() == "Apply Slant Range Correction"
+    assert not window.slant_range_checkbox.isChecked()
+    assert window.destripe_button.text() == "Apply Destripe Filter"
+    assert window.destripe_button.isCheckable()
     assert [
         button.text()
         for button in groups[0].findChildren(QPushButton)
@@ -181,6 +213,23 @@ def test_processing_panel_starts_with_gain_and_view_controls(qtbot, tmp_path):
         "BAC",
     ):
         assert removed_text not in visible_text
+
+
+def test_geotiff_export_group_has_crs_and_file_or_batch_controls(qtbot):
+    window = QMainWindow()
+    qtbot.addWidget(window)
+    window._emphasize_sidebar_group = QtContactPickerWindow._emphasize_sidebar_group
+    window.export_current_geotiff = lambda: None
+    window.export_geotiff_directory = lambda: None
+
+    group = QtContactPickerWindow._build_geotiff_export_group(window)
+    qtbot.addWidget(group)
+
+    assert group.title() == "GeoTIFF Export"
+    assert "border: 2px solid" in group.styleSheet()
+    assert [window.geotiff_crs.itemData(index) for index in range(2)] == [4326, 3857]
+    assert window.export_current_geotiff_button.text() == "Export Current File"
+    assert window.export_directory_geotiff_button.text() == "Batch Export Directory…"
 
 
 def test_egn_table_nadir_angle_uses_saved_metadata(tmp_path):
@@ -256,6 +305,9 @@ class _GainSettingsWindow(QMainWindow):
         self.processing_mode.addItem("Raw waterfall", BuiltInGainMode.RAW.value)
         self.processing_mode.addItem("EGN", BuiltInGainMode.EGN.value)
         self.egn_path = QLineEdit()
+        self.destripe_button = QPushButton("Apply Destripe Filter")
+        self.destripe_button.setCheckable(True)
+        self.slant_range_checkbox = QCheckBox("Apply Slant Range Correction")
         self._restoring_gain_settings = False
         self._pending_restored_gain_settings = None
         self.gain_settings_save_timer = QTimer(self)
@@ -278,6 +330,8 @@ def test_gain_settings_autosave_debounces_and_writes_next_to_sonar(qtbot, tmp_pa
     window.tvg_spreading_spin.setValue(22.0)
     window.tvg_absorption_spin.setValue(0.15)
     window.along_track_spin.setValue(2.5)
+    window.destripe_button.setChecked(True)
+    window.slant_range_checkbox.setChecked(True)
 
     with qtbot.waitSignal(window.gain_settings_save_timer.timeout, timeout=1000):
         pass
@@ -288,6 +342,8 @@ def test_gain_settings_autosave_debounces_and_writes_next_to_sonar(qtbot, tmp_pa
     assert saved.tvg_spreading_db_per_decade == 22.0
     assert saved.tvg_absorption_db_per_m == 0.15
     assert saved.speed_correction_px_per_ping == 2.5
+    assert saved.destripe_active is True
+    assert saved.slant_range_correction_active is True
 
 
 def test_opening_a_sonar_file_creates_default_gain_settings(qtbot, tmp_path):
@@ -379,6 +435,65 @@ def test_egn_gain_settings_restore_path_and_schedule_processing(qtbot, tmp_path)
     assert notice is None
     assert window.processing_mode.currentData() == "egn"
     assert Path(window.egn_path.text()) == table_path
+    assert window._pending_restored_gain_settings is not None
+
+
+def test_raw_destripe_setting_is_restored_and_reprocessed(qtbot, tmp_path):
+    sonar_path = tmp_path / "line.jsf"
+    save_gain_settings(
+        sonar_path,
+        SonarGainSettings(
+            source_file=sonar_path.name,
+            overall_gain_db=-5.0,
+            tvg_spreading_db_per_decade=5.0,
+            tvg_absorption_db_per_m=0.08,
+            auto_tvg_brightness_target_percent=30,
+            auto_tvg_active=False,
+            auto_tvg_gain_db=(),
+            speed_correction_px_per_ping=3.0,
+            processing_mode="raw",
+            egn_table_path=None,
+            destripe_active=True,
+        ),
+    )
+    window = _GainSettingsWindow(sonar_path)
+    qtbot.addWidget(window)
+
+    notice = window._restore_file_gain_settings()
+    qtbot.waitUntil(lambda: window.applied_processing == 1, timeout=1000)
+
+    assert notice is None
+    assert window.processing_mode.currentData() == "raw"
+    assert window.destripe_button.isChecked()
+    assert window._pending_restored_gain_settings is not None
+
+
+def test_slant_range_setting_is_restored_and_reprocessed(qtbot, tmp_path):
+    sonar_path = tmp_path / "line.jsf"
+    save_gain_settings(
+        sonar_path,
+        SonarGainSettings(
+            source_file=sonar_path.name,
+            overall_gain_db=-5.0,
+            tvg_spreading_db_per_decade=5.0,
+            tvg_absorption_db_per_m=0.08,
+            auto_tvg_brightness_target_percent=30,
+            auto_tvg_active=False,
+            auto_tvg_gain_db=(),
+            speed_correction_px_per_ping=3.0,
+            processing_mode="raw",
+            egn_table_path=None,
+            slant_range_correction_active=True,
+        ),
+    )
+    window = _GainSettingsWindow(sonar_path)
+    qtbot.addWidget(window)
+
+    notice = window._restore_file_gain_settings()
+    qtbot.waitUntil(lambda: window.applied_processing == 1, timeout=1000)
+
+    assert notice is None
+    assert window.slant_range_checkbox.isChecked()
     assert window._pending_restored_gain_settings is not None
 
 

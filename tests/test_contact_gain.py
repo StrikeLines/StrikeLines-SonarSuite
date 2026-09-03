@@ -5,6 +5,7 @@ import pytest
 
 from sidescantools.contact_gain import (
     BuiltInGainMode,
+    BuiltInGainProcessor,
     BuiltInGainRequest,
     ground_to_slant_display,
     normalize_processed_waterfall,
@@ -58,10 +59,52 @@ def test_egn_validation_reports_missing_fields(tmp_path: Path):
     path = tmp_path / "invalid.npz"
     np.savez(path, egn_table=np.ones((2, 2)))
 
-    from sidescantools.contact_gain import BuiltInGainProcessor
-
     with pytest.raises(ValueError, match="missing"):
         BuiltInGainProcessor._validate_egn_table(path)
+
+
+def test_raw_processing_can_apply_fast_destripe_filter():
+    across_track = np.linspace(0.05, 0.35, 32)
+    source = np.tile(np.concatenate((across_track[::-1], across_track)), (151, 1))
+    source *= np.tile((0.7, 1.0, 1.25), 51)[:151, None]
+    processor = BuiltInGainProcessor(object(), source)
+
+    result = processor.process(BuiltInGainRequest(mode="raw", destripe=True))
+
+    assert result.pipeline_description.endswith("raw|destripe")
+    assert np.std(np.median(result.display_data, axis=1)) < (
+        np.std(np.median(source, axis=1)) * 0.05
+    )
+
+
+def test_slant_range_option_returns_ground_range_without_water_column():
+    class FakePreprocessor:
+        def __init__(self):
+            self.sonar_data_proc = np.ones((2, 2, 4), dtype=float)
+            self.projected = np.array(
+                [
+                    [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+                    [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+                ]
+            )
+
+        def slant_range_correction(self, **kwargs):
+            self.dep_info = np.full((2, 2), 2.0)
+            self.slant_corrected_mat = self.projected.copy()
+
+    preprocessor = FakePreprocessor()
+    raw = np.zeros((2, 8), dtype=float)
+
+    result = BuiltInGainProcessor(preprocessor, raw).process(
+        BuiltInGainRequest(mode="raw", slant_range_correction=True)
+    )
+
+    np.testing.assert_allclose(
+        result.display_data,
+        normalize_processed_waterfall(preprocessor.projected),
+    )
+    assert result.pipeline_description.endswith("raw|slant-range-corrected")
+    assert np.all(result.display_data[:, 3:5] > 0)
 
 
 def test_builtin_bac_corrects_both_port_and_starboard_channels():

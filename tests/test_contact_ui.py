@@ -13,6 +13,7 @@ from sidescantools.contact_model import (
 from sidescantools.contact_store import ContactStore
 from sidescantools.contact_ui import ContactDock
 from sidescantools.swath_geometry import GeometrySettings
+from qtpy.QtWidgets import QGroupBox
 
 
 def create_contact(
@@ -89,6 +90,24 @@ def test_contact_dock_edits_refreshes_and_deletes(qtbot, tmp_path):
 
         assert dock.model.rowCount() == 0
         assert store.list_contacts() == []
+
+
+def test_waypoint_exports_have_their_own_dark_outlined_group(qtbot, tmp_path):
+    with ContactStore(tmp_path / "contacts.sqlite") as store:
+        source = store.register_source_file(
+            tmp_path / "survey.jsf",
+            format="jsf",
+            ping_count=10,
+            source_sample_count=9,
+        )
+        dock = ContactDock(store, source.id, export_directory=tmp_path)
+        qtbot.addWidget(dock)
+
+        group = dock.findChild(QGroupBox)
+        assert group.title() == "Waypoint Export"
+        assert "border: 2px solid #111" in group.styleSheet()
+        assert dock.export_selected_button in group.findChildren(type(dock.export_selected_button))
+        assert dock.export_all_button in group.findChildren(type(dock.export_all_button))
 
 
 def test_contact_dock_autosaves_edit_before_switching_selection(qtbot, tmp_path):

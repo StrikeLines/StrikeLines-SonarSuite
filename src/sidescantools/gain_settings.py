@@ -28,6 +28,8 @@ class SonarGainSettings:
     speed_correction_px_per_ping: float
     processing_mode: str
     egn_table_path: str | None
+    destripe_active: bool = False
+    slant_range_correction_active: bool = False
 
     def __post_init__(self) -> None:
         if self.processing_mode not in {"raw", "egn"}:
@@ -67,6 +69,10 @@ class SonarGainSettings:
             "processing": {
                 "mode": self.processing_mode,
                 "egn_table_path": self.egn_table_path,
+                "destripe_active": self.destripe_active,
+                "slant_range_correction_active": (
+                    self.slant_range_correction_active
+                ),
             },
         }
 
@@ -100,6 +106,10 @@ class SonarGainSettings:
                 str(processing["egn_table_path"])
                 if processing.get("egn_table_path")
                 else None
+            ),
+            destripe_active=bool(processing.get("destripe_active", False)),
+            slant_range_correction_active=bool(
+                processing.get("slant_range_correction_active", False)
             ),
         )
 

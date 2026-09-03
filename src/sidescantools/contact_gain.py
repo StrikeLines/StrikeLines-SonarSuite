@@ -12,6 +12,7 @@ from typing import Callable
 import numpy as np
 
 from sidescantools.aux_functions import convert_to_dB, hist_equalization
+from sidescantools.destripe import destripe_waterfall
 
 
 class BuiltInGainMode(str, Enum):
@@ -31,6 +32,8 @@ class BuiltInGainRequest:
     clahe: bool = False
     nadir_angle: float = 0.0
     use_internal_altitude: bool = False
+    destripe: bool = False
+    slant_range_correction: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", BuiltInGainMode(self.mode))
@@ -134,7 +137,11 @@ class BuiltInGainProcessor:
         notify = progress or (lambda percent, text: None)
         notify(2, "Preparing processing data")
 
-        if request.mode is BuiltInGainMode.RAW:
+        show_ground_range = (
+            request.slant_range_correction
+            or request.mode is BuiltInGainMode.SLANT
+        )
+        if request.mode is BuiltInGainMode.RAW and not show_ground_range:
             display = np.clip(
                 np.nan_to_num(self.raw, nan=0.0, posinf=1.0, neginf=0.0),
                 0.0,
@@ -174,13 +181,23 @@ class BuiltInGainProcessor:
                 processor.do_EGN_correction(request.egn_table_path)
                 ground = processor.egn_corrected_mat
 
-            notify(78, "Restoring acoustic sample positions")
-            display = ground_to_slant_display(ground, processor.dep_info)
+            if show_ground_range:
+                notify(78, "Removing water column")
+                display = ground
+            else:
+                notify(78, "Restoring acoustic sample positions")
+                display = ground_to_slant_display(ground, processor.dep_info)
             display = normalize_processed_waterfall(display)
 
         stages = [request.mode.value]
+        if show_ground_range and request.mode is not BuiltInGainMode.SLANT:
+            stages.append("slant-range-corrected")
         if request.mode is BuiltInGainMode.BAC and request.energy_normalization:
             stages.append("energy-normalized")
+        if request.destripe:
+            notify(83, "Applying destripe filter")
+            display = destripe_waterfall(display)
+            stages.append("destripe")
         if request.convert_db:
             notify(86, "Converting display to dB")
             converted = np.array(display, dtype=float, copy=True)
