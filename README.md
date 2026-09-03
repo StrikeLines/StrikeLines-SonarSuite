@@ -1,7 +1,7 @@
 
 # SidescanTools — StrikeLines Fork
 
-[Windows Installer Download ](https://github.com/StrikeLines/sidescantools/releases/download/v1.0.0/SidescanTools-Windows-x64.zip)
+## Quick Start: [Windows Installer Download ](https://github.com/StrikeLines/sidescantools/releases/download/v1.0.0/SidescanTools-Windows-x64.zip)
 
 > This repository is a Windows-compatible fork of
 > [sonoware/sidescantools](https://github.com/sonoware/sidescantools). It adds a Qt raster workspace for digitizing contacts,
