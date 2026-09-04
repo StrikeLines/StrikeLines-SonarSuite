@@ -14,7 +14,7 @@ SonarSuite was forked from the excellent
 SonarSuite currently supports **JSF** (`.jsf`) and **XTF** (`.xtf`) sonar files.
 Support for additional formats is planned.
 
-**[Download SonarSuite for Windows](https://github.com/StrikeLines/sidescantools/releases/latest/download/SidescanTools-Windows-x64.zip)**
+**[Download SonarSuite for Windows](https://github.com/StrikeLines/StrikeLines-SonarSuite/releases/latest/download/SidescanTools-Windows-x64.zip)**
 
 New user? Jump to the [Windows Setup Quickstart](#windows-setup-quickstart).
 
@@ -39,7 +39,7 @@ SonarSuite supports the complete GUI-based side-scan workflow:
 The release build is recommended for nearly all Windows users. It does not
 require Python, Conda, or a development environment.
 
-1. **[Download the Windows ZIP](https://github.com/StrikeLines/sidescantools/releases/latest/download/SidescanTools-Windows-x64.zip).**
+1. **[Download the Windows ZIP](https://github.com/StrikeLines/StrikeLines-SonarSuite/releases/latest/download/SidescanTools-Windows-x64.zip).**
 2. Unzip the downloaded file.
 3. Open the extracted `SidescanTools` folder.
 4. Double-click `SidescanTools.exe`.
@@ -71,13 +71,13 @@ recalculated after geometry changes and exported as WGS 84 GPX waypoints.
 ## Installing from source on Windows
 
 Building from source is intended for developers. Most users should install the
-**[Windows release binary](https://github.com/StrikeLines/sidescantools/releases/latest/download/SidescanTools-Windows-x64.zip)**.
+**[Windows release binary](https://github.com/StrikeLines/StrikeLines-SonarSuite/releases/latest/download/SidescanTools-Windows-x64.zip)**.
 
 Source installation requires Git and Miniconda or Anaconda. Open Anaconda
 Prompt or a Conda-enabled PowerShell and run:
 
 ```powershell
-git clone https://github.com/StrikeLines/sidescantools.git SonarSuite
+git clone https://github.com/StrikeLines/StrikeLines-SonarSuite.git SonarSuite
 cd SonarSuite
 conda env create -f environment.yml
 conda activate env_sidescantools
@@ -94,6 +94,6 @@ a JSF or XTF file. Windows release maintainers can also follow the
 SonarSuite is a project of [StrikeLines](https://strikelines.com/).
 
 For feature requests or bug reports, please
-[create a GitHub issue](https://github.com/StrikeLines/sidescantools/issues).
+[create a GitHub issue](https://github.com/StrikeLines/StrikeLines-SonarSuite/issues).
 
 SonarSuite is released under the [GNU General Public License v3.0](LICENSE).
