@@ -26,6 +26,24 @@ class SyntheticSidescanFile:
         self.data = np.zeros((2, ping_count, sample_count), dtype=float)
 
 
+class ShortSyntheticSidescanFile:
+    """A valid survey line shorter than the legacy smoothing windows."""
+
+    def __init__(self):
+        ping_count = 12
+        sample_count = 7
+        ping = np.arange(ping_count, dtype=float)
+
+        self.packet_no = np.arange(60_000, 60_000 + ping_count)
+        self.longitude = -70.0 + ping * 0.00001
+        self.latitude = 40.0 + ping * 0.000005
+        self.sensor_heading = (350.0 + ping * 0.2) % 360.0
+        self.slant_range = np.vstack(
+            (30.0 + ping * 0.002, 32.0 + ping * 0.002)
+        )
+        self.data = np.zeros((2, ping_count, sample_count), dtype=float)
+
+
 def prepared_georeferencer(channel):
     georeferencer = Georeferencer.__new__(Georeferencer)
     georeferencer.sidescan_file = SyntheticSidescanFile()
@@ -91,6 +109,22 @@ class GeoreferencerCharacterizationTests(unittest.TestCase):
         self.assertIs(georeferencer.sidescan_file, source)
         self.assertIs(georeferencer.geometry_settings, settings)
         self.assertEqual(georeferencer.cable_out, 9)
+
+    def test_short_survey_uses_adaptive_smoothing_windows(self):
+        source = ShortSyntheticSidescanFile()
+        settings = GeometrySettings(vertical_beam_angle=60)
+        georeferencer = Georeferencer(
+            filepath="short.xtf",
+            sidescan_file=source,
+            geometry_settings=settings,
+            output_folder=".",
+        )
+
+        geometry = georeferencer.prepare_swath_geometry()
+
+        self.assertEqual(geometry.ping_count, 12)
+        self.assertTrue(np.all(np.isfinite(geometry.nadir_lon)))
+        self.assertTrue(np.all(np.isfinite(geometry.outer_lon)))
 
     def test_channels_share_nadir_and_have_different_outer_coordinates(self):
         port = prepared_georeferencer(channel=0).nav.reshape(-1, 7, 2)

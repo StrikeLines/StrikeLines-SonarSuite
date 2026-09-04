@@ -21,6 +21,19 @@ if TYPE_CHECKING:
     from sidescantools.sidescan_file import SidescanFile
 
 
+def _safe_savgol_filter(values, preferred_window: int, polyorder: int):
+    """Smooth a track without exceeding the number of available pings."""
+
+    array = np.asarray(values)
+    sample_count = array.shape[-1]
+    window_length = min(int(preferred_window), sample_count)
+    if window_length % 2 == 0:
+        window_length -= 1
+    if window_length <= polyorder:
+        return array.copy()
+    return savgol_filter(array, window_length, polyorder)
+
+
 class Georeferencer:
     filepath: str | os.PathLike
     sidescan_file: SidescanFile
@@ -189,7 +202,7 @@ class Georeferencer:
             ping_unique, cog, k=3, s=len(ping_unique) / 2
         )
         cog_intp = cog_spl(ping_uniform)
-        self.cog_smooth = savgol_filter(cog_intp, 100, 3)
+        self.cog_smooth = _safe_savgol_filter(cog_intp, 100, 3)
 
     def prep_data(self, *, build_bulk_nav=True):
         # Extract metadata for each ping in sonar channel
@@ -233,7 +246,7 @@ class Georeferencer:
         # Unwrap to avoid jumps when crossing 0/360° degree angle
         HEAD_ori_rad = np.deg2rad(HEAD_ori)
         head_unwrapped = np.unwrap(HEAD_ori_rad)
-        head_unwrapped_savgol = savgol_filter(head_unwrapped, 100, 2)
+        head_unwrapped_savgol = _safe_savgol_filter(head_unwrapped, 100, 2)
         HEAD_savgol = (np.rad2deg(head_unwrapped_savgol)) % 360
 
         # Remove duplicate values
@@ -316,8 +329,8 @@ class Georeferencer:
         lo_intp = lo_spl(PING_uniform)
         la_intp = la_spl(PING_uniform)
 
-        lo_intp = savgol_filter(lo_intp, 100, 2)
-        la_intp = savgol_filter(la_intp, 100, 2)
+        lo_intp = _safe_savgol_filter(lo_intp, 100, 2)
+        la_intp = _safe_savgol_filter(la_intp, 100, 2)
 
         # interpolate easting northing to full swath length
         east_spl = interpolate.make_interp_spline(
@@ -328,8 +341,8 @@ class Georeferencer:
         )
         east_intp = east_spl(PING_uniform)
         north_intp = north_spl(PING_uniform)
-        east_intp = savgol_filter(east_intp, 100, 2)
-        north_intp = savgol_filter(north_intp, 100, 2)
+        east_intp = _safe_savgol_filter(east_intp, 100, 2)
+        north_intp = _safe_savgol_filter(north_intp, 100, 2)
 
         # Resize UTM Zone and Letter arrays to fit interpolated array sizes
         UTM_ZONE = np.resize(UTM_ZONE, len(east_intp))
@@ -353,8 +366,8 @@ class Georeferencer:
                 ]
             )
 
-            east_out_intp_savgol = savgol_filter(EAST_OUTER, 300, 2)
-            north_out_intp_savgol = savgol_filter(NORTH_OUTER, 300, 2)
+            east_out_intp_savgol = _safe_savgol_filter(EAST_OUTER, 300, 2)
+            north_out_intp_savgol = _safe_savgol_filter(NORTH_OUTER, 300, 2)
 
             self.LALO_OUTER = [
                 utm.to_latlon(east_ch1, north_ch1, utm_zone, utm_let)
@@ -382,8 +395,8 @@ class Georeferencer:
                 ]
             )
 
-            east_out_intp_savgol = savgol_filter(EAST_OUTER, 300, 2)
-            north_out_intp_savgol = savgol_filter(NORTH_OUTER, 300, 2)
+            east_out_intp_savgol = _safe_savgol_filter(EAST_OUTER, 300, 2)
+            north_out_intp_savgol = _safe_savgol_filter(NORTH_OUTER, 300, 2)
 
             self.LALO_OUTER = [
                 utm.to_latlon(east_ch2, north_ch2, utm_zone, utm_let)
