@@ -1481,6 +1481,17 @@ def test_apply_bottom_edit_combine_strategy_mirrors_the_other_side(qtbot):
     assert window.preprocessor.napari_starboard_bottom[0, 0] == 5 - 2  # ping_len - column
 
 
+def test_apply_bottom_edit_clamps_combined_edge_values(qtbot):
+    window = _bottom_edit_window(
+        qtbot, num_ping=6, ping_len=5, chunk_size=3, strategy_text="Combine both sides"
+    )
+
+    window._apply_bottom_edit(0, 0)
+
+    assert window.preprocessor.napari_portside_bottom[0, 0] == 1
+    assert window.preprocessor.napari_starboard_bottom[0, 0] == 4
+
+
 def test_apply_bottom_edit_ignores_a_row_past_the_last_chunk(qtbot):
     window = _bottom_edit_window(qtbot, num_ping=6, ping_len=5, chunk_size=3)
 

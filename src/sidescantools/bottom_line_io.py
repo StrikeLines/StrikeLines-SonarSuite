@@ -24,15 +24,43 @@ def compute_depth_info(
     ``SidescanPreprocessor.set_depth_from_info``. Returns ``None`` when no
     depth was logged.
     """
-    depth_info = sidescan_file.depth
-    if depth_info[0] == 0:
+    if downsampling_factor <= 0:
+        raise ValueError("downsampling_factor must be greater than zero")
+
+    # Work on a copy: converting meters to indices must never overwrite the
+    # source metadata used elsewhere for altitude and geometry calculations.
+    depth_m = np.asarray(sidescan_file.depth, dtype=float).copy()
+    valid_depth = np.isfinite(depth_m) & (depth_m > 0)
+    if not np.any(valid_depth):
         return None
-    for ping_idx in range(sidescan_file.num_ping):
-        depth_info[ping_idx] = np.round(
-            np.argmin(np.abs(depth_info[ping_idx] - sidescan_file.ping_x_axis))
-            / downsampling_factor
+
+    ping_axis = np.asarray(sidescan_file.ping_x_axis, dtype=float)
+    if ping_axis.size == 0:
+        raise ValueError("The sonar sample-distance axis is empty.")
+
+    depth_info = np.zeros(depth_m.shape, dtype=int)
+    if ping_axis.size == 1:
+        return depth_info
+
+    valid_values = depth_m[valid_depth]
+    if np.all(np.diff(ping_axis) >= 0):
+        upper = np.clip(
+            np.searchsorted(ping_axis, valid_values), 1, len(ping_axis) - 1
         )
-    return depth_info.astype(int)
+        nearest = np.where(
+            np.abs(valid_values - ping_axis[upper - 1])
+            <= np.abs(valid_values - ping_axis[upper]),
+            upper - 1,
+            upper,
+        )
+    else:
+        # Unexpected axes still get a correct answer, without mutating the
+        # source data, even though the fast searchsorted path is unavailable.
+        nearest = np.array(
+            [np.argmin(np.abs(value - ping_axis)) for value in valid_values]
+        )
+    depth_info[valid_depth] = np.round(nearest / downsampling_factor).astype(int)
+    return depth_info
 
 
 def save_bottom_info(
@@ -98,9 +126,9 @@ def load_bottom_info(
     path = Path(path)
     if not (path.exists() and path.suffix == ".npz"):
         raise FileNotFoundError(f"no bottom-line file at {path}")
-    bottom_info = np.load(path)
-    napari_portside_bottom = bottom_info["bottom_info_port"].flatten()
-    napari_starboard_bottom = bottom_info["bottom_info_star"].flatten()
+    with np.load(path) as bottom_info:
+        napari_portside_bottom = bottom_info["bottom_info_port"].flatten().copy()
+        napari_starboard_bottom = bottom_info["bottom_info_star"].flatten().copy()
     # flip order for xtf files to contain backwards compability
     if sidescan_file.filepath.suffix.casefold() == ".xtf":
         napari_portside_bottom[: sidescan_file.num_ping] = np.flip(

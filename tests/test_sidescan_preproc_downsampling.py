@@ -29,6 +29,32 @@ class PreprocessorDownsamplingTests(unittest.TestCase):
         self.assertEqual(preprocessor.ping_len, 32)
         self.assertEqual(preprocessor.num_chunk, 4)
 
+    def test_bottom_edge_tracking_accepts_a_clicked_start_position(self):
+        edges = np.zeros((3, 20), dtype=bool)
+        edges[:, 12] = True
+
+        result = SidescanPreprocessor.edges_to_bottom_dist(
+            None,
+            edges,
+            threshold_bin=0.5,
+            data_is_port_side=False,
+            click_pos=10,
+            dist_at_ends=2,
+        )
+
+        np.testing.assert_array_equal(result, [12, 12, 12])
+
+    def test_bottom_edge_tracking_handles_an_empty_chunk(self):
+        result = SidescanPreprocessor.edges_to_bottom_dist(
+            None,
+            np.zeros((0, 20), dtype=bool),
+            threshold_bin=0.5,
+            data_is_port_side=False,
+            dist_at_ends=2,
+        )
+
+        self.assertEqual(result.size, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

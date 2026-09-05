@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import logging
 import os
 from typing import TYPE_CHECKING
 
@@ -19,6 +20,9 @@ from sidescantools.swath_geometry import GeometrySettings, SwathGeometry
 
 if TYPE_CHECKING:
     from sidescantools.sidescan_file import SidescanFile
+
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_savgol_filter(values, preferred_window: int, polyorder: int):
@@ -182,6 +186,12 @@ class Georeferencer:
         ping_uniform:  np.ndarray
             Ping array for original length with monotonous ping numbers to evaluate spline
         """
+        lo = np.asarray(lo, dtype=float)
+        la = np.asarray(la, dtype=float)
+        ping_unique = np.asarray(ping_unique, dtype=float)
+        if len(ping_unique) < 2:
+            raise ValueError("At least two unique navigation fixes are required.")
+
         cog = np.empty_like(lo)
         LON_DIFF = np.diff(lo, prepend=np.nan)
         LAT_DIFF = np.diff(la, prepend=np.nan)
@@ -198,8 +208,9 @@ class Georeferencer:
         cog = np.rad2deg(cog)
 
         # Interpolate cog with univariate to get smooth curve; smoothing factor have been empirically defined
+        spline_degree = min(3, len(ping_unique) - 1)
         cog_spl = interpolate.UnivariateSpline(
-            ping_unique, cog, k=3, s=len(ping_unique) / 2
+            ping_unique, cog, k=spline_degree, s=len(ping_unique) / 2
         )
         cog_intp = cog_spl(ping_uniform)
         self.cog_smooth = _safe_savgol_filter(cog_intp, 100, 3)
@@ -225,14 +236,22 @@ class Georeferencer:
         HEAD_ori = np.ndarray.flatten(np.array(HEAD_ori))
         SLANT_RANGE = np.ndarray.flatten(np.array(SLANT_RANGE))
 
+        # The vertical beam angle is measured down from horizontal, so the
+        # horizontal (ground-range) component is slant * sin(angle).  Keep it
+        # positive; port/starboard direction is applied below.
         ground_range = [
-            math.cos(self.vertical_beam_angle) * slant_range * (-1)
+            math.sin(math.radians(self.vertical_beam_angle)) * slant_range
             for slant_range in SLANT_RANGE
         ]
         GROUND_RANGE.append(ground_range)
         GROUND_RANGE = np.ndarray.flatten(np.array(GROUND_RANGE))
 
-        ZERO_MASK = LON_ori != 0
+        ZERO_MASK = (
+            np.isfinite(LON_ori)
+            & np.isfinite(LAT_ori)
+            & (LON_ori != 0)
+            & (LAT_ori != 0)
+        )
 
         LON_ori = LON_ori[ZERO_MASK]
         LAT_ori = LAT_ori[ZERO_MASK]
@@ -249,44 +268,65 @@ class Georeferencer:
         head_unwrapped_savgol = _safe_savgol_filter(head_unwrapped, 100, 2)
         HEAD_savgol = (np.rad2deg(head_unwrapped_savgol)) % 360
 
-        # Remove duplicate values
-        UNIQUE_MASK = np.empty_like(LON_ori)
-        i = 0
-        for i, (lo, la, uni) in enumerate(zip(LON_ori, LAT_ori, UNIQUE_MASK)):
-            if LON_ori[i] == LON_ori[i - 1] and LAT_ori[i] == LAT_ori[i - 1]:
-                UNIQUE_MASK[i] = np.nan
-            else:
-                UNIQUE_MASK[i] = 0
-        UNIQUE_MASK = [
-            False if np.isnan(unique_val) else True for unique_val in UNIQUE_MASK
-        ]
+        if len(LON_ori) < 2:
+            raise ValueError("At least two valid navigation fixes are required.")
+
+        # Preserve the original ping positions of navigation fixes. Renumbering
+        # unique fixes compresses duplicate runs and shifts the whole track.
+        UNIQUE_MASK = np.ones(len(LON_ori), dtype=bool)
+        UNIQUE_MASK[1:] = (LON_ori[1:] != LON_ori[:-1]) | (
+            LAT_ori[1:] != LAT_ori[:-1]
+        )
         LON_unique = LON_ori[UNIQUE_MASK]
         LAT_unique = LAT_ori[UNIQUE_MASK]
-        PING_UNIQUE = [ping_no for ping_no in range(len(LON_unique))]
-
-        # create uniform ping sequence for smooth curvature with original number of pings as length and last entry of unique ping for
-        # maximum ping number, else b-spline will extrapolate which messes up coordinates
-        PING_uniform = np.linspace(0, len(PING_UNIQUE) - 1, len(self.PING))
+        PING_UNIQUE = np.flatnonzero(UNIQUE_MASK)
 
         # Convert to UTM to calculate outer swath coordinates for both channels
-        UTM = np.full_like(LAT_unique, np.nan)
-        UTM = UTM.tolist()
+        UTM = [None] * len(LAT_unique)
         for idx, (la, lo) in enumerate(zip(LAT_unique, LON_unique)):
             try:
                 UTM[idx] = utm.from_latlon(la, lo)
-            except:
-                ValueError("Values or lon and/or lat must not be 0")
+            except (ValueError, OverflowError):
+                # A malformed isolated fix should not abort an otherwise valid
+                # file. Drop the fix while retaining its original ping index.
+                continue
 
-        if UTM:
-            EAST = [utm_coord[0] for utm_coord in UTM]
-            NORTH = [utm_coord[1] for utm_coord in UTM]
-            NORTH = np.asarray(NORTH)
-            EAST = np.asarray(EAST)
-            UTM_ZONE = [utm_coord[2] for utm_coord in UTM]
-            UTM_LET = [utm_coord[3] for utm_coord in UTM]
-            crs = CRS.from_dict({"proj": "utm", "zone": UTM_ZONE[0], "south": False})
-            epsg = crs.to_authority()
-            self.epsg_code = f"{epsg[0]}:{epsg[1]}"
+        valid_utm = np.array([coord is not None for coord in UTM], dtype=bool)
+        conversion_failures = int(np.count_nonzero(~valid_utm))
+        if conversion_failures:
+            logger.warning(
+                "%s: dropped %d navigation fix(es) that could not be converted to UTM",
+                Path(self.filepath).name,
+                conversion_failures,
+            )
+        UTM = [coord for coord in UTM if coord is not None]
+        LON_unique = LON_unique[valid_utm]
+        LAT_unique = LAT_unique[valid_utm]
+        PING_UNIQUE = PING_UNIQUE[valid_utm]
+        if len(UTM) < 2:
+            raise ValueError(
+                "At least two valid, unique navigation fixes are required."
+            )
+
+        EAST = np.asarray([utm_coord[0] for utm_coord in UTM])
+        NORTH = np.asarray([utm_coord[1] for utm_coord in UTM])
+        UTM_ZONE = [utm_coord[2] for utm_coord in UTM]
+        UTM_LET = [utm_coord[3] for utm_coord in UTM]
+        is_southern_hemisphere = UTM_LET[0] < "N"
+        crs = CRS.from_dict(
+            {"proj": "utm", "zone": UTM_ZONE[0], "south": is_southern_hemisphere}
+        )
+        epsg = crs.to_authority()
+        if epsg is None:
+            raise ValueError(
+                "Unable to determine a projected CRS for sonar navigation."
+            )
+        self.epsg_code = f"{epsg[0]}:{epsg[1]}"
+
+        # Evaluate on every retained ping. Clipping avoids extrapolation if an
+        # invalid conversion occurred at either end of the track.
+        PING_uniform = np.arange(len(self.PING), dtype=float)
+        PING_uniform = np.clip(PING_uniform, PING_UNIQUE[0], PING_UNIQUE[-1])
 
         # calculate cog from east/north
         self.calculate_cog(EAST, NORTH, PING_UNIQUE, PING_uniform)
@@ -297,8 +337,9 @@ class Georeferencer:
         north_offset = []
         east_offset = []
         lalo_offset = []
+        heading_at_unique_fixes = self.cog_smooth[PING_UNIQUE]
         for east, north, utm_zone, letter, head in zip(
-            EAST, NORTH, UTM_ZONE, UTM_LET, self.cog_smooth
+            EAST, NORTH, UTM_ZONE, UTM_LET, heading_at_unique_fixes
         ):
             east_lay = (
                 east
@@ -318,11 +359,12 @@ class Georeferencer:
         Lat_offset, Lon_offset = map(np.array, zip(*lalo_offset))
 
         # B-Spline lon/lats and filter to obtain esqual-interval, unique coordinates for each ping
+        spline_degree = min(3, len(PING_UNIQUE) - 1)
         lo_spl = interpolate.make_interp_spline(
-            PING_UNIQUE, Lon_offset, k=3, bc_type="not-a-knot"
+            PING_UNIQUE, Lon_offset, k=spline_degree
         )
         la_spl = interpolate.make_interp_spline(
-            PING_UNIQUE, Lat_offset, k=3, bc_type="not-a-knot"
+            PING_UNIQUE, Lat_offset, k=spline_degree
         )
 
         # Evaluate spline at equally spaced pings and smooth again with savgol filter
@@ -334,10 +376,10 @@ class Georeferencer:
 
         # interpolate easting northing to full swath length
         east_spl = interpolate.make_interp_spline(
-            PING_UNIQUE, east_offset, k=3, bc_type="not-a-knot"
+            PING_UNIQUE, east_offset, k=spline_degree
         )
         north_spl = interpolate.make_interp_spline(
-            PING_UNIQUE, north_offset, k=3, bc_type="not-a-knot"
+            PING_UNIQUE, north_offset, k=spline_degree
         )
         east_intp = east_spl(PING_uniform)
         north_intp = north_spl(PING_uniform)
@@ -497,9 +539,8 @@ class Georeferencer:
             alpha = Image.fromarray(alpha)
             image_to_write.putalpha(alpha)
         png_info = PngInfo()
-        png_info.add_text("Info", "Generated by SidescanTools")
+        png_info.add_text("Info", "Generated by SonarSuite")
         image_to_write.save(im_path, pnginfo=png_info)
-        image_to_write.save(im_path)
 
     def georeference(self, bs_data, progress_signal=None):
         """
@@ -517,6 +558,7 @@ class Georeferencer:
         """
 
         import pygmt
+        import rioxarray  # noqa: F401 - registers the xarray ``.rio`` accessor
 
         # Determine pixel size based on minimum distance between coordinates
         self.get_pix_size(self.nav[:, 0], self.nav[:, 1], res_factor=1)
@@ -617,16 +659,11 @@ class Georeferencer:
 
     def process(self, progress_signal=None):
         # Check if enough data are present, otherwise quit
-        if len(self.PING) > 300:
+        if len(self.PING) >= 2:
             self.prepare_swath_geometry(force=True, build_bulk_nav=True)
             chan_stack_flat = self.channel_stack()
 
-            try:
-                self.georeference(
-                    bs_data=chan_stack_flat, progress_signal=progress_signal
-                )
-            except Exception as e:
-                print(str(e))
+            self.georeference(bs_data=chan_stack_flat, progress_signal=progress_signal)
 
             # Export navigation data
             if self.active_export_navdata:
@@ -645,7 +682,9 @@ class Georeferencer:
                     header="Nadir Longitude; Nadir Latitude; BS",
                 )
         else:
-            print("Only {len(self.PING)} pings present. Quitting.")
+            raise ValueError(
+                f"At least two pings are required; found {len(self.PING)}."
+            )
 
 
 def main():
@@ -671,19 +710,19 @@ def main():
     )
     parser.add_argument(
         "--UTM",
-        type=bool,
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Uses UTM projection rather than WGS84. Default is UTM",
     )
     parser.add_argument(
         "--navdata",
-        type=bool,
+        action=argparse.BooleanOptionalAction,
         default=False,
         help="If true, exports navigation data to csv",
     )
     parser.add_argument(
         "--blockmedian",
-        type=bool,
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="If True, uses blockmedian before nearneighbour alg. for gridding to reduce noise and data size. Default True.",
     )

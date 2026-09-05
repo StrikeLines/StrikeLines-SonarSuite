@@ -116,3 +116,30 @@ def test_compute_depth_info_converts_meters_to_sample_index(tmp_path):
     depth_info = compute_depth_info(sidescan_file, downsampling_factor=1)
 
     np.testing.assert_array_equal(depth_info, [2, 3, 0])
+
+
+def test_compute_depth_info_does_not_mutate_logged_depth(tmp_path):
+    sidescan_file = _SyntheticSidescanFile(tmp_path / "line.jsf", num_ping=3)
+    sidescan_file.depth = np.array([4.0, 6.0, 2.0])
+    original = sidescan_file.depth.copy()
+
+    compute_depth_info(sidescan_file, downsampling_factor=1)
+
+    np.testing.assert_array_equal(sidescan_file.depth, original)
+
+
+def test_compute_depth_info_uses_later_valid_depths(tmp_path):
+    sidescan_file = _SyntheticSidescanFile(tmp_path / "line.jsf", num_ping=3)
+    sidescan_file.ping_x_axis = np.array([0.0, 2.0, 4.0, 6.0, 8.0])
+    sidescan_file.depth = np.array([0.0, 6.0, 4.0])
+
+    depth_info = compute_depth_info(sidescan_file, downsampling_factor=1)
+
+    np.testing.assert_array_equal(depth_info, [0, 3, 2])
+
+
+def test_compute_depth_info_rejects_invalid_downsampling_factor(tmp_path):
+    sidescan_file = _SyntheticSidescanFile(tmp_path / "line.jsf")
+
+    with pytest.raises(ValueError, match="downsampling_factor"):
+        compute_depth_info(sidescan_file, downsampling_factor=0)

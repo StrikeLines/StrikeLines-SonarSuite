@@ -19,6 +19,15 @@ from sidescantools.contact_model import (
 
 
 class GPXExporterTests(unittest.TestCase):
+    def test_export_identifies_sonarsuite_as_the_creator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "contacts.gpx"
+            GPXExporter().export([self.record(1, 1)], destination)
+
+            root = ET.parse(destination).getroot()
+
+            self.assertEqual(root.attrib["creator"], "SonarSuite Contact Picker")
+
     def record(
         self,
         contact_id,

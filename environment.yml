@@ -19,3 +19,6 @@ dependencies:
   - pyqtgraph
   - conda-forge::utm==0.7.0
   - conda-forge::pyxtf==1.4.2
+  - scipy
+  - scikit-image==0.25.2
+  - pillow

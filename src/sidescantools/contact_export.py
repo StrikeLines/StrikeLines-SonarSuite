@@ -14,6 +14,8 @@ from sidescantools.contact_model import ContactRecord, CoordinateStatus
 
 
 GPX_NAMESPACE = "http://www.topografix.com/GPX/1/1"
+# Keep the upstream namespace for compatibility with GPX files already
+# exported by this project. It is a stable identifier, not a project link.
 SIDESCAN_NAMESPACE = "https://github.com/sonoware/sidescantools/contact/1"
 ET.register_namespace("", GPX_NAMESPACE)
 ET.register_namespace("sct", SIDESCAN_NAMESPACE)
@@ -81,7 +83,7 @@ class GPXExporter:
 
         root = ET.Element(
             ET.QName(GPX_NAMESPACE, "gpx"),
-            {"version": "1.1", "creator": "SidescanTools Contact Picker"},
+            {"version": "1.1", "creator": "SonarSuite Contact Picker"},
         )
         for contact in eligible:
             self._append_waypoint(root, contact)

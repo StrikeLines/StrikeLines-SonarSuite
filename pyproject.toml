@@ -5,17 +5,36 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sidescantools"
 version = "1.0.1"
-description = "Tools for sidescan sonar processing"
+description = "SonarSuite - fast, standalone sidescan sonar processing"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
-  "rasterio>=1.4,<2",
-]
 authors = [
-  { name="SidescanTools Team", email="sidescantools@sonoware.de" }
+  { name = "StrikeLines" },
 ]
 license = "GPL-3.0"
 license-files = ["LICENSE"]
+dependencies = [
+  "geopy",
+  "numpy>=2,<3",
+  "pillow",
+  "pyproj",
+  "PyQt5>=5.15",
+  "pyxtf>=1.4",
+  "qtpy",
+  "rasterio>=1.4,<2",
+  "scikit-image>=0.25",
+  "scipy",
+  "utm",
+]
+
+[project.optional-dependencies]
+napari = ["napari", "magicgui", "pyqtgraph", "pydantic>=2", "pyyaml"]
+gmt = ["pygmt", "rioxarray"]
+
+[project.urls]
+Homepage = "https://strikelines.com/"
+Repository = "https://github.com/StrikeLines/StrikeLines-SonarSuite"
+Issues = "https://github.com/StrikeLines/StrikeLines-SonarSuite/issues"
 
 [project.scripts]
 sidescantools-contacts = "sidescantools.contact_picker_app:main"

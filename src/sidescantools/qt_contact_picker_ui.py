@@ -3037,20 +3037,25 @@ class QtContactPickerWindow(QMainWindow):
             self.bottom_strategy_combo.currentText()
             == preproc.bottom_strategy_choices[1]
         )
+
+        def clamp_bottom(value):
+            return max(1, min(preproc.ping_len - 1, value))
+
         if column < preproc.ping_len:
-            preproc.napari_portside_bottom[chunk_idx, local_ping_idx] = column
+            port_sample = clamp_bottom(column)
+            preproc.napari_portside_bottom[chunk_idx, local_ping_idx] = port_sample
             if combine_both_sides:
                 preproc.napari_starboard_bottom[chunk_idx, local_ping_idx] = (
-                    preproc.ping_len - column
+                    clamp_bottom(preproc.ping_len - port_sample)
                 )
         else:
-            starboard_sample = column - preproc.ping_len
+            starboard_sample = clamp_bottom(column - preproc.ping_len)
             preproc.napari_starboard_bottom[chunk_idx, local_ping_idx] = (
                 starboard_sample
             )
             if combine_both_sides:
                 preproc.napari_portside_bottom[chunk_idx, local_ping_idx] = (
-                    preproc.ping_len - starboard_sample
+                    clamp_bottom(preproc.ping_len - starboard_sample)
                 )
         preproc.update_bottom_map_napari(chunk_idx, add_line_width=0)
         preproc.sync_chunked_bottom_to_flat(chunk_idx)

@@ -1,6 +1,6 @@
 package:
   name: sidescantools
-  version: 1.0.0
+  version: 1.0.1
 
 source:
   path: ..
@@ -8,9 +8,6 @@ source:
 build:
   number: 0
   script: python -m pip install . --no-deps -vv
-  entry_points:
-    - sidescantools_gui = sidescantools.main_gui:main
-    - sidescantools_cli = sidescantools.main_cli:main
 
 requirements:
   host:
@@ -24,6 +21,7 @@ requirements:
     - scikit-image==0.25.2
     - geopy
     - numpy==2.3.3
+    - pillow
     - conda-forge::napari
     - conda-forge::pyqt==5.*
     - conda-forge::gdal==3.10.3
@@ -33,19 +31,20 @@ requirements:
     - pygmt==0.17.0
     - rioxarray==0.18.1
     - rasterio==1.4.3
+    - scipy
     - pyqtgraph
     - conda-forge::utm
-    - conda-foreg::pyxtf
+    - conda-forge::pyxtf==1.4.2
 
 test:
   imports:
     - sidescantools
 
 about:
-  home: https://sidescantools.de
-  summary: "Tools for sidescan sonar processing"
+  home: https://github.com/StrikeLines/StrikeLines-SonarSuite
+  summary: "SonarSuite - fast, standalone sidescan sonar processing"
   license: GPL-3.0
 
 extra:
   recipe-maintainers:
-    - sonofisp
+    - StrikeLines

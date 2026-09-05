@@ -201,11 +201,7 @@ class SidescanToolsMain:
                 print(f"Cleaning ...")
                 for file in os.listdir(self.cfg.main_proc_params.georef_dir):
                     file_path = os.path.join(self.cfg.main_proc_params.georef_dir, file)
-                    if (
-                        str(file_path).startswith("outmedian")
-                        or str(file_path).endswith(".xml")
-                        or str(file_path).endswith(".xyz")
-                    ):
+                    if file.startswith("outmedian_") and file.endswith(".xyz"):
                         try:
                             os.remove(file_path)
                         except FileNotFoundError:

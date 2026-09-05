@@ -434,8 +434,8 @@ class SidescanToolsMain(QWidget):
         self.cfg.main_proc_params.egn_table_path = str(
             pathlib.Path(self.egn_table_picker.cur_dir).absolute()
         )
-        egn_table_info = np.load(self.egn_table_picker.cur_dir)
-        nadir_angle = egn_table_info["nadir_angle"]
+        with np.load(self.egn_table_picker.cur_dir) as egn_table_info:
+            nadir_angle = egn_table_info["nadir_angle"].copy()
         self.processing_widget.nadir_angle_edit.line_edit.setText(str(nadir_angle))
         self.cfg.main_proc_params.nadir_angle = nadir_angle
 

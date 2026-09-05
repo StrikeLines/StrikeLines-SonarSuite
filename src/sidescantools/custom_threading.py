@@ -214,6 +214,7 @@ class EGNTableBuilder(QWidget):
 
         self.pbar_val = 0
         self.files_finished = 0
+        self._had_error = False
         self.egn_table_path = egn_table_path
         self.pbar = QProgressBar(self)
         self.pbar.setGeometry(30, 40, 500, 50)
@@ -258,15 +259,24 @@ class EGNTableBuilder(QWidget):
         out_path = pathlib.Path(out_path)
         for sonar_file_path in files:
             bottom_path = out_path / (sonar_file_path.stem + "_bottom_info.npz")
-            if bottom_path.exists():
+            if bottom_path.exists() or active_intern_depth:
                 res_sonar_path_list.append(sonar_file_path)
-                res_bottom_path_list.append(bottom_path)
+                res_bottom_path_list.append(
+                    bottom_path if bottom_path.exists() else None
+                )
                 self.res_egn_path_list.append(
                     out_path / (sonar_file_path.stem + "_egn_info.npz")
                 )
 
-        self.num_files = len(files)
-        self.pbar.setMaximum = 100
+        self.num_files = len(res_sonar_path_list)
+        self.pbar.setMaximum(100)
+        if self.num_files == 0:
+            self.build_aborted(
+                ValueError("No sonar files with usable bottom information were found.")
+            )
+            self.deleteLater()
+            return
+
         for file_idx in range(self.num_files):
             new_worker = EGNTableProcessingWorker(
                 res_sonar_path_list[file_idx],
@@ -296,17 +306,20 @@ class EGNTableBuilder(QWidget):
     def files_finished_counter(self):
         self.files_finished += 1
         if self.files_finished == self.num_files:
-            self.build_final_table()
-            self.send_table_finished()
+            if self._had_error:
+                self.deleteLater()
+            else:
+                self.build_final_table()
+                self.send_table_finished()
 
     def send_table_finished(self):
         self.table_finished.emit()
         self.deleteLater()
 
     def build_aborted(self, err: Exception):
+        self._had_error = True
         msg_str = str(err)
         self.aborted_signal.emit(msg_str)
-        self.deleteLater()
 
 
 class PreProcWorkerSignals(QtCore.QObject):
@@ -370,11 +383,12 @@ class PreProcWorker(QtCore.QRunnable):
         sidescan_file = SidescanFile(filepath=self.filepath)
         downsampling_factor = 1
         if not self.active_internal_altitude:
-            bottom_info = np.load(self.bottom_file)
+            with np.load(self.bottom_file) as archive:
+                bottom_info = {key: archive[key].copy() for key in archive.files}
             # Check if downsampling was applied
             try:
                 downsampling_factor = bottom_info["downsampling_factor"]
-            except:
+            except KeyError:
                 downsampling_factor = 1
 
             portside_bottom_dist = bottom_info["bottom_info_port"].flatten()[
@@ -439,8 +453,8 @@ class PreProcWorker(QtCore.QRunnable):
 
         self.signals.progress.emit(0.1)
         if self.load_slant_data:
-            slant_data = np.load(slant_data_path)
-            preproc.slant_corrected_mat = slant_data["slant_corr"]
+            with np.load(slant_data_path) as slant_data:
+                preproc.slant_corrected_mat = slant_data["slant_corr"].copy()
 
         else:
             if self.active_pie_slice_filter:
@@ -465,8 +479,10 @@ class PreProcWorker(QtCore.QRunnable):
                     )
 
                 if self.load_gain_data:
-                    egn_data = np.load(gain_corrected_path)
-                    preproc.egn_corrected_mat = egn_data["egn_corrected_mat"]
+                    with np.load(gain_corrected_path) as egn_data:
+                        preproc.egn_corrected_mat = egn_data[
+                            "egn_corrected_mat"
+                        ].copy()
                 else:
                     preproc.do_EGN_correction(
                         self.egn_table_path,
@@ -475,8 +491,10 @@ class PreProcWorker(QtCore.QRunnable):
                 self.signals.progress.emit(0.4)
             elif self.active_bac:
                 if self.load_gain_data:
-                    gain_corrected_data = np.load(gain_corrected_path)
-                    preproc.egn_corrected_mat = gain_corrected_data["egn_corrected_mat"]
+                    with np.load(gain_corrected_path) as gain_corrected_data:
+                        preproc.egn_corrected_mat = gain_corrected_data[
+                            "egn_corrected_mat"
+                        ].copy()
                     self.signals.progress.emit(0.4)
                 else:
                     preproc.apply_beam_pattern_correction(angle_num=self.num_angle_bac)
@@ -517,6 +535,8 @@ class PreProcManager(QWidget):
 
         self.pbar_val = 0
         self.files_finished = 0
+        self._had_error = False
+        self._last_result = None
         self.pbar = QProgressBar(self)
         self.pbar.setGeometry(30, 40, 500, 50)
         self.pbar.setTextVisible(False)
@@ -581,7 +601,7 @@ class PreProcManager(QWidget):
 
         self.num_files = len(res_sonar_path_list)
         if self.num_files > 0:
-            self.pbar.setMaximum = 100
+            self.pbar.setMaximum(100)
             for file_idx in range(self.num_files):
                 new_worker = PreProcWorker(
                     filepath=res_sonar_path_list[file_idx],
@@ -623,14 +643,22 @@ class PreProcManager(QWidget):
 
     def files_finished_counter(self, res_list):
         self.files_finished += 1
+        self._last_result = res_list
         self.new_res_present.emit(res_list)
-        if self.files_finished == self.num_files:
-            self.processing_finished.emit(res_list)
-            self.deleteLater()
+        self._finish_if_complete()
 
     def build_aborted(self, err: Exception):
+        self.files_finished += 1
+        self._had_error = True
         msg_str = str(err)
         self.aborted_signal.emit(msg_str)
+        self._finish_if_complete()
+
+    def _finish_if_complete(self):
+        if self.files_finished != self.num_files:
+            return
+        if not self._had_error and self._last_result is not None:
+            self.processing_finished.emit(self._last_result)
         self.deleteLater()
 
 
@@ -700,9 +728,6 @@ class GeoreferencerThread(QtCore.QThread):
         self.y_offset = y_offset
 
     def georef(self):
-        georef_success = True
-        err_msg = f"Error while Georeferencing {self.filepath}"
-
         processor_0 = Georeferencer(
             filepath=self.filepath,
             channel=0,
@@ -737,11 +762,7 @@ class GeoreferencerThread(QtCore.QThread):
         )  # from georef.py
         processor_1.process(self.progress_signal)
 
-        if georef_success:
-            self.status_signal.emit("Georeferencing finished")
-            self.finished.emit()
-        else:
-            self.error_signal.emit(str(err_msg))
+        self.status_signal.emit("Georeferencing finished")
 
     def run(self):
         try:
@@ -756,12 +777,10 @@ class GeoreferencerManager(QWidget):
     processing_finished = QtCore.Signal(list)
     aborted = QtCore.Signal(str)
     pbar_val: float
-    cleanup_cnt: int  # fix for now
 
     def __init__(self):
         super().__init__()
         self.pbar_val = 0
-        self.cleanup_cnt = 0
         self.pbar = QProgressBar(self)
         self.pbar.setGeometry(30, 40, 500, 50)
         self.pbar.setTextVisible(False)
@@ -822,12 +841,7 @@ class GeoreferencerManager(QWidget):
         )
         self.georef_thread.finished.connect(self.cleanup)
         self.georef_thread.finished.connect(self.georef_thread.deleteLater)
-        self.georef_thread.aborted_signal.connect(
-            lambda msg_str: self.georef_aborted(msg_str)
-        )
-        self.georef_thread.finished.connect(self.cleanup)
-        self.georef_thread.finished.connect(self.georef_thread.deleteLater)
-        self.georef_thread.aborted_signal.connect(
+        self.georef_thread.error_signal.connect(
             lambda msg_str: self.georef_aborted(msg_str)
         )
         self.georef_thread.start()
@@ -843,27 +857,20 @@ class GeoreferencerManager(QWidget):
         self.cleanup()
 
     def georef_aborted(self, msg_str: str):
-        self.aborted_signal.emit(msg_str)
-        self.deleteLater()
-        self.cleanup()
+        self.aborted.emit(str(msg_str))
 
     def cleanup(self):
-        self.cleanup_cnt += 1
-        if (
-            self.cleanup_cnt > 1
-        ):  # we need the signal 2 times for both channels to have finished
-            print(f"Cleaning ...")
-            for file in os.listdir(self.output_folder):
-                file_path = os.path.join(self.output_folder, file)
-                if (
-                    str(file_path).startswith("outmedian")
-                    or str(file_path).endswith(".xml")
-                    or str(file_path).endswith(".xyz")
-                ):
-                    try:
-                        os.remove(file_path)
-                    except FileNotFoundError:
-                        print(f"File Not Found: {file_path}")
+        print("Cleaning ...")
+        for file in self.output_folder.iterdir():
+            if (
+                file.is_file()
+                and file.name.startswith("outmedian_")
+                and file.suffix == ".xyz"
+            ):
+                try:
+                    file.unlink()
+                except FileNotFoundError:
+                    print(f"File Not Found: {file}")
 
-            print("Cleanup done")
-            self.deleteLater()
+        print("Cleanup done")
+        self.deleteLater()

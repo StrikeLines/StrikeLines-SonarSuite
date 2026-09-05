@@ -5,6 +5,30 @@ import os
 import pathlib
 
 
+def fill_missing_slant_ranges(slant_ranges: np.ndarray) -> np.ndarray:
+    """Return slant ranges with missing entries filled from nearby valid data.
+
+    Interior and trailing gaps use the preceding range. Leading gaps use the
+    first valid range in that channel. The input array is not modified.
+    """
+
+    filled = np.asarray(slant_ranges, dtype=float).copy()
+    if filled.ndim != 2:
+        raise ValueError("slant_ranges must be a channels-by-pings array")
+
+    for channel in filled:
+        valid = np.isfinite(channel) & (channel > 0)
+        valid_indices = np.flatnonzero(valid)
+        if valid_indices.size == 0:
+            continue
+        first_valid = int(valid_indices[0])
+        channel[:first_valid] = channel[first_valid]
+        for index in range(first_valid + 1, len(channel)):
+            if not np.isfinite(channel[index]) or channel[index] <= 0:
+                channel[index] = channel[index - 1]
+    return filled
+
+
 def accumulate_egn_bins(egn_mat, egn_hit_cnt, r_idx, alpha_idx, values, r_size, angle_num):
     """Scatter-accumulate one ping's samples into the EGN mat/hit-count bins.
 
@@ -52,24 +76,25 @@ def generate_egn_info(
     # check if bottom_file exists otherwise switch to intern altitude
     if bottom_file is not None and active_intern_depth == False:
         if pathlib.Path(bottom_file).exists():
-            bottom_info = np.load(bottom_file)
+            with np.load(bottom_file) as archive:
+                bottom_info = {key: archive[key].copy() for key in archive.files}
         else:
             active_intern_depth = True
     else:
         active_intern_depth = True
 
-    # Slant ranges might be incomplete, fill up with previous values
-    for ch in range(sidescan_file.num_ch):
-        for idx in range(len(sidescan_file.slant_range[0])):
-            if sidescan_file.slant_range[ch, idx] == 0:
-                sidescan_file.slant_range[ch, idx] = sidescan_file.slant_range[ch, -1]
+    # Slant ranges might be incomplete; do not replace an interior gap with
+    # the final range from the file, which creates an artificial discontinuity.
+    sidescan_file.slant_range = fill_missing_slant_ranges(
+        sidescan_file.slant_range
+    )
 
     # Check if downsampling was applied
     downsampling_factor = 1
     if active_intern_depth == False:
         try:
             downsampling_factor = bottom_info["downsampling_factor"]
-        except:
+        except KeyError:
             downsampling_factor = 1
 
         portside_bottom_dist = bottom_info["bottom_info_port"].flatten()[
@@ -103,7 +128,7 @@ def generate_egn_info(
             # if lengths don't match, bottom line might be padded to fill the last last chunk
             try:
                 bottom_chunk_size = bottom_info["chunk_size"]
-            except:
+            except KeyError:
                 bottom_chunk_size = chunk_size
             expected_full_chunk_size = int(
                 np.ceil(sidescan_file.num_ping / bottom_chunk_size) * bottom_chunk_size
@@ -212,36 +237,36 @@ def generate_egn_info(
 
 
 def generate_egn_table_from_infos(egn_path_list: list, egn_table_path: os.PathLike):
+    if not egn_path_list:
+        raise ValueError("At least one EGN info file is required.")
+
     do_init = True
     for egn_file in egn_path_list:
-        egn_info = np.load(egn_file)
+        with np.load(egn_file) as egn_info:
+            if do_init:
+                # Copy arrays before the NPZ handle closes.
+                full_mat = egn_info["egn_mat"].copy()
+                full_hit_cnt = egn_info["egn_hit_cnt"].copy()
+                angle_range_init = egn_info["angle_range"].copy()
+                angle_num_init = egn_info["angle_num"].copy()
+                angle_stepsize_init = egn_info["angle_stepsize"].copy()
+                ping_len_init = egn_info["ping_len"].copy()
+                r_size_init = egn_info["r_size"].copy()
+                r_reduc_factor_init = egn_info["r_reduc_factor"].copy()
+                nadir_angle = egn_info["nadir_angle"].copy()
 
-        if do_init:
-            full_mat = egn_info["egn_mat"]
-            full_hit_cnt = egn_info["egn_hit_cnt"]
-            angle_range_init = egn_info["angle_range"]
-            angle_num_init = egn_info["angle_num"]
-            angle_stepsize_init = egn_info["angle_stepsize"]
-            ping_len_init = egn_info["ping_len"]
-            r_size_init = egn_info["r_size"]
-            r_reduc_factor_init = egn_info["r_reduc_factor"]
-            nadir_angle = egn_info["nadir_angle"]
+                do_init = False
 
-            do_init = False
-
-        else:
-            if (
-                (angle_range_init == egn_info["angle_range"]).all()
+            elif (
+                np.array_equal(angle_range_init, egn_info["angle_range"])
                 and angle_num_init == egn_info["angle_num"]
                 and angle_stepsize_init == egn_info["angle_stepsize"]
                 and ping_len_init == egn_info["ping_len"]
                 and r_size_init == egn_info["r_size"]
                 and r_reduc_factor_init == egn_info["r_reduc_factor"]
             ):
-
                 full_mat += egn_info["egn_mat"]
                 full_hit_cnt += egn_info["egn_hit_cnt"]
-
             else:
                 print(f"EGN Parameter mismatch! Skipping file: {egn_file}")
 

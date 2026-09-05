@@ -279,7 +279,7 @@ class SidescanPreprocessor:
                 ]
             )
 
-            self.build_bottom_line_map()
+        self.build_bottom_line_map()
 
     def build_bottom_line_map(self):
 
@@ -627,15 +627,17 @@ class SidescanPreprocessor:
     ):
 
         cand_start = 0
+        candidates = []
+        ping_len = np.shape(edges)[1]
+        edge_list = np.array([], dtype=int)
         # TODO: cand_start von außen einstellbar machen (per Mausclick) -> Loopen von da aus in beide Richtungen, um den den Candidaten zu verfolgen?
         idx = 0
 
         # if a position has been clicked, this shall be our start candidate
-        if click_pos:
-            pass
+        if click_pos is not None:
+            cand_start = int(click_pos)
         else:
             # find first ping edge result, where only one candidate is present as initial guess
-            ping_len = np.shape(edges)[1]
             while cand_start == 0 and idx < np.shape(edges)[0]:
                 edge_list = (
                     np.where(edges[idx, dist_at_ends : -1 * dist_at_ends])[0]
@@ -645,7 +647,6 @@ class SidescanPreprocessor:
                 if len(edge_list) == 1:
                     cand_start = edge_list[0]
 
-            candidates = []
             # if no start idx is found, choose first or last idx, depending on where thresh is closer to
             if len(edge_list) == 0:
                 if threshold_bin < 0.5:
@@ -667,7 +668,7 @@ class SidescanPreprocessor:
                 + dist_at_ends
             )
             # else choose closest candidate, otherwise if no edge is present, just keep last guess
-            if len(edge_list > 0):
+            if len(edge_list) > 0:
                 closest_idx = np.argmin(abs(edge_list - last_cand))
                 last_cand = edge_list[closest_idx]
             candidates.append(last_cand)
@@ -1335,12 +1336,12 @@ class SidescanPreprocessor:
             (self.sonar_data_proc[0], self.sonar_data_proc[1])
         )
 
-        y_axis_m = self.gen_simple_y_axis()
         # revert flip
         self.sonar_data_proc[0] = np.fliplr(self.sonar_data_proc[0])
 
         # save intensity table/histogram for EGN
         if save_to is not None:
+            y_axis_m = self.gen_simple_y_axis()
             save_to = Path(save_to)
             if save_to.suffix != ".npz":
                 save_to = save_to.with_suffix(".npz")
@@ -1399,15 +1400,15 @@ class SidescanPreprocessor:
             If not ``None`` the resulting slant corrected matrix is saved as ``.npz`` to the provided path
         """
 
-        egn_info = np.load(egn_table_path)
-        egn_table = egn_info["egn_table"]
-        egn_hit_cnt = egn_info["egn_hit_cnt"]
-        angle_range = egn_info["angle_range"]
-        angle_num = egn_info["angle_num"]
-        angle_stepsize = egn_info["angle_stepsize"]
-        table_ping_len = egn_info["ping_len"]
-        r_size = egn_info["r_size"]
-        r_reduc_factor = egn_info["r_reduc_factor"]
+        with np.load(egn_table_path) as egn_info:
+            egn_table = egn_info["egn_table"].copy()
+            egn_hit_cnt = egn_info["egn_hit_cnt"].copy()
+            angle_range = egn_info["angle_range"].copy()
+            angle_num = egn_info["angle_num"].copy()
+            angle_stepsize = egn_info["angle_stepsize"].copy()
+            table_ping_len = egn_info["ping_len"].copy()
+            r_size = egn_info["r_size"].copy()
+            r_reduc_factor = egn_info["r_reduc_factor"].copy()
 
         # The table may have been built at a different resolution
         # (downsampling factor) than the data currently loaded -- e.g. a

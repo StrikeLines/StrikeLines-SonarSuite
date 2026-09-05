@@ -98,7 +98,7 @@ class SidescanFile:
     sensor_roll: np.ndarray
     """Roll in degrees (positive=roll to starboard)"""
     sensor_speed: np.ndarray
-    """Speed of towfish in knots"""
+    """Speed of towfish in meters per second"""
     sensor_aux_altitude: np.ndarray
     """Auxiliary altitude"""
 
@@ -175,9 +175,10 @@ class SidescanFile:
                 self.sensor_roll[p_idx] = xtf.packets[pyxtf.XTFHeaderType.sonar][
                     p_idx
                 ].SensorRoll
-                self.sensor_speed[p_idx] = xtf.packets[pyxtf.XTFHeaderType.sonar][
-                    p_idx
-                ].SensorSpeed
+                self.sensor_speed[p_idx] = (
+                    xtf.packets[pyxtf.XTFHeaderType.sonar][p_idx].SensorSpeed
+                    / 1.943844
+                )
                 self.sensor_aux_altitude[p_idx] = xtf.packets[
                     pyxtf.XTFHeaderType.sonar
                 ][p_idx].SensorAuxAltitude
