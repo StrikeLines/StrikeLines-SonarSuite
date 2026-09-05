@@ -20,7 +20,7 @@ from uuid import uuid4
 import numpy as np
 import pyproj
 from pyproj import Geod, Transformer
-from scipy.ndimage import binary_dilation, maximum_filter
+from scipy.ndimage import convolve
 
 from sidescantools.bottom_line_io import compute_depth_info, load_bottom_info
 from sidescantools.contact_gain import (
@@ -43,7 +43,177 @@ from sidescantools.swath_geometry import GeometrySettings, SwathGeometry
 SUPPORTED_EPSG_CODES = (4326, 3857)
 DEFAULT_MAX_RASTER_PIXELS = 40_000_000
 _TVG_FLOOR_FRACTION = 0.02
+_MAX_PING_INTERPOLATION_STEPS = 16
 _GEOD = Geod(ellps="WGS84")
+
+
+def _fill_small_grid_voids(
+    intensity: np.ndarray,
+    valid_pixels: np.ndarray,
+    *,
+    max_passes: int = 3,
+) -> int:
+    """Fill tiny interior rasterization gaps with weighted local averages.
+
+    The arrays are updated in place. Cardinal neighbours receive twice the
+    weight of diagonal neighbours, producing a fast bilinear-like estimate.
+    Requiring dense support on every pass prevents the fill from growing the
+    outside edge of the sonar swath while still closing gaps a few cells wide.
+    """
+
+    if intensity.shape != valid_pixels.shape or intensity.ndim != 2:
+        raise ValueError("intensity and valid_pixels must be matching 2D arrays")
+    if max_passes < 0:
+        raise ValueError("max_passes cannot be negative")
+    if not max_passes or not np.any(valid_pixels):
+        return 0
+
+    kernel = np.array(
+        [[1, 2, 1], [2, 0, 2], [1, 2, 1]],
+        dtype=np.uint8,
+    )
+    filled_count = 0
+    for _ in range(max_passes):
+        neighbour_weight = convolve(
+            valid_pixels,
+            kernel,
+            output=np.uint8,
+            mode="constant",
+            cval=0,
+        )
+        # A straight outside edge contributes at most four weighted units.
+        # Five therefore fills locally enclosed gaps without dilating the
+        # footprint into surrounding transparent pixels.
+        candidates = (~valid_pixels) & (neighbour_weight >= 5)
+        pass_count = int(np.count_nonzero(candidates))
+        if not pass_count:
+            break
+
+        weighted_sum = convolve(
+            intensity,
+            kernel,
+            output=np.uint16,
+            mode="constant",
+            cval=0,
+        )
+        weights = neighbour_weight[candidates]
+        interpolated = np.rint(weighted_sum[candidates] / weights).astype(np.uint8)
+        intensity[candidates] = interpolated
+        valid_pixels[candidates] = True
+        filled_count += pass_count
+
+    return filled_count
+
+
+def _deposit_projected_samples(
+    x: np.ndarray,
+    y: np.ndarray,
+    values: np.ndarray,
+    *,
+    origin_x: float,
+    origin_y: float,
+    resolution_x: float,
+    resolution_y: float,
+    intensity: np.ndarray,
+    valid_pixels: np.ndarray,
+) -> None:
+    """Bin projected samples into the output raster using maximum intensity."""
+
+    x = np.asarray(x)
+    y = np.asarray(y)
+    values = np.asarray(values)
+    finite = np.isfinite(x) & np.isfinite(y)
+    columns = np.zeros(x.shape, dtype=np.int64)
+    rows = np.zeros(y.shape, dtype=np.int64)
+    columns[finite] = np.floor((x[finite] - origin_x) / resolution_x).astype(
+        np.int64
+    )
+    rows[finite] = np.floor((origin_y - y[finite]) / resolution_y).astype(
+        np.int64
+    )
+    inside = (
+        finite
+        & (rows >= 0)
+        & (rows < intensity.shape[0])
+        & (columns >= 0)
+        & (columns < intensity.shape[1])
+    )
+    np.maximum.at(intensity, (rows[inside], columns[inside]), values[inside])
+    valid_pixels[rows[inside], columns[inside]] = True
+
+
+def _deposit_interpolated_ping_lines(
+    x: np.ndarray,
+    y: np.ndarray,
+    values: np.ndarray,
+    source_ping_indices: np.ndarray,
+    *,
+    origin_x: float,
+    origin_y: float,
+    resolution_x: float,
+    resolution_y: float,
+    intensity: np.ndarray,
+    valid_pixels: np.ndarray,
+    max_steps: int = _MAX_PING_INTERPOLATION_STEPS,
+) -> int:
+    """Rasterize intermediate lines between consecutive, widely spaced pings.
+
+    The number of lines adapts to projected pixel spacing. Pairs separated by
+    a missing navigation ping or an implausibly large jump are left open so
+    interpolation cannot bridge real survey discontinuities.
+    """
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    values = np.asarray(values, dtype=np.uint8)
+    source_ping_indices = np.asarray(source_ping_indices)
+    if x.shape != y.shape or x.shape != values.shape or x.ndim != 2:
+        raise ValueError("ping coordinates and values must be matching 2D arrays")
+    if source_ping_indices.shape != (x.shape[0],):
+        raise ValueError("source_ping_indices must identify every ping row")
+    if max_steps < 1:
+        raise ValueError("max_steps must be positive")
+    if x.shape[0] < 2:
+        return 0
+
+    delta_columns = np.abs(np.diff(x, axis=0)) / resolution_x
+    delta_rows = np.abs(np.diff(y, axis=0)) / resolution_y
+    pair_distance_pixels = np.nanmax(
+        np.maximum(delta_columns, delta_rows), axis=1
+    )
+    required_steps = np.maximum(1, np.ceil(pair_distance_pixels).astype(int))
+    consecutive = np.diff(source_ping_indices) == 1
+    eligible = consecutive & (required_steps > 1) & (required_steps <= max_steps)
+
+    inserted_line_count = 0
+    for step_count in np.unique(required_steps[eligible]):
+        pair_indices = np.flatnonzero(eligible & (required_steps == step_count))
+        left_x = x[pair_indices]
+        left_y = y[pair_indices]
+        left_values = values[pair_indices].astype(np.float32)
+        for step in range(1, int(step_count)):
+            fraction = step / float(step_count)
+            interpolated_x = left_x + fraction * (x[pair_indices + 1] - left_x)
+            interpolated_y = left_y + fraction * (y[pair_indices + 1] - left_y)
+            interpolated_values = np.rint(
+                left_values
+                + fraction
+                * (values[pair_indices + 1].astype(np.float32) - left_values)
+            ).astype(np.uint8)
+            _deposit_projected_samples(
+                interpolated_x,
+                interpolated_y,
+                interpolated_values,
+                origin_x=origin_x,
+                origin_y=origin_y,
+                resolution_x=resolution_x,
+                resolution_y=resolution_y,
+                intensity=intensity,
+                valid_pixels=valid_pixels,
+            )
+        inserted_line_count += len(pair_indices) * (int(step_count) - 1)
+
+    return inserted_line_count
 
 
 def _configure_pyproj_data(*extra_candidates: Path) -> Path:
@@ -466,6 +636,7 @@ def export_prepared_waterfall(
     valid_pixels = np.zeros((height, width), dtype=bool)
     fractions = np.linspace(0.0, 1.0, channel_width)
     ping_chunk = max(1, min(512, 2_000_000 // max(1, channel_width)))
+    interpolated_ping_line_count = 0
 
     notify(75, "Rasterizing port and starboard swaths")
     for channel in (0, 1):
@@ -480,7 +651,12 @@ def export_prepared_waterfall(
 
         valid_indices = np.flatnonzero(geometry.valid_ping_mask)
         for start in range(0, len(valid_indices), ping_chunk):
-            indices = valid_indices[start : start + ping_chunk]
+            # Include the next ping so interpolation also spans chunk
+            # boundaries. Its original samples may be deposited twice, which
+            # is harmless because raster collisions use maximum intensity.
+            indices = valid_indices[
+                start : min(start + ping_chunk + 1, len(valid_indices))
+            ]
             lon = geometry.nadir_lon[indices, None] + fractions[None, :] * (
                 geometry.outer_lon[indices, None]
                 - geometry.nadir_lon[indices, None]
@@ -490,30 +666,39 @@ def export_prepared_waterfall(
                 - geometry.nadir_lat[indices, None]
             )
             x, y = transformer.transform(lon, lat)
-            columns = np.floor((np.asarray(x) - origin_x) / resolution_x).astype(int)
-            rows = np.floor((origin_y - np.asarray(y)) / resolution_y).astype(int)
             values = channel_gray[indices]
-            inside = (
-                np.isfinite(x)
-                & np.isfinite(y)
-                & (rows >= 0)
-                & (rows < height)
-                & (columns >= 0)
-                & (columns < width)
+            _deposit_projected_samples(
+                x,
+                y,
+                values,
+                origin_x=origin_x,
+                origin_y=origin_y,
+                resolution_x=resolution_x,
+                resolution_y=resolution_y,
+                intensity=intensity,
+                valid_pixels=valid_pixels,
             )
-            np.maximum.at(intensity, (rows[inside], columns[inside]), values[inside])
-            valid_pixels[rows[inside], columns[inside]] = True
+            interpolated_ping_line_count += _deposit_interpolated_ping_lines(
+                x,
+                y,
+                values,
+                indices,
+                origin_x=origin_x,
+                origin_y=origin_y,
+                resolution_x=resolution_x,
+                resolution_y=resolution_y,
+                intensity=intensity,
+                valid_pixels=valid_pixels,
+            )
 
     if not np.any(valid_pixels):
         raise ValueError("no sonar samples fell inside the output raster")
 
-    # Fill only tiny one-cell rasterization gaps. This is the direct-gridding
-    # counterpart of the upstream near-neighbour search radius, without
-    # creating large XYZ intermediates or bleeding across separated swaths.
-    neighbours = binary_dilation(valid_pixels, iterations=1) & ~valid_pixels
-    nearby_max = maximum_filter(intensity, size=3, mode="constant")
-    intensity[neighbours] = nearby_max[neighbours]
-    valid_pixels[neighbours] = True
+    # Close the tiny multi-cell voids created when projected ping/sample
+    # coordinates fall between raster cells. The weighted, vectorized passes
+    # run in compiled SciPy code and do not expand the transparent swath edge.
+    notify(90, "Interpolating tiny grid gaps")
+    filled_void_count = _fill_small_grid_voids(intensity, valid_pixels)
 
     red = intensity
     green = (intensity.astype(float) * 0.78).astype(np.uint8)
@@ -554,6 +739,8 @@ def export_prepared_waterfall(
                 SOURCE_FILE=Path(sonar_path).name,
                 SIDESCANTOOLS_DISPLAY_PIPELINE=pipeline_description,
                 TARGET_CRS=f"EPSG:{epsg}",
+                INTERPOLATED_PING_LINES=str(interpolated_ping_line_count),
+                INTERPOLATED_VOID_PIXELS=str(filled_void_count),
             )
         if destination.exists() and not overwrite:
             raise FileExistsError(destination)

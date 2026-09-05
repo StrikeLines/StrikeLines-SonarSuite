@@ -10,6 +10,8 @@ from sidescantools.gain_settings import SonarGainSettings
 from sidescantools.gain_settings import save_gain_settings
 from sidescantools.geotiff_export import (
     _configure_pyproj_data,
+    _deposit_interpolated_ping_lines,
+    _fill_small_grid_voids,
     export_prepared_waterfall,
     geotiff_output_path,
     prepare_sonar_export,
@@ -70,6 +72,104 @@ def test_output_path_is_beside_source_and_uses_same_basename(tmp_path):
     assert geotiff_output_path(tmp_path / "survey-line.xtf") == (
         tmp_path / "survey-line.tif"
     )
+
+
+def test_small_grid_void_fill_interpolates_linear_intensity():
+    rows, columns = np.indices((7, 7))
+    expected = (rows * 10 + columns * 2).astype(np.uint8)
+    intensity = expected.copy()
+    valid = np.ones(intensity.shape, dtype=bool)
+    intensity[3, 3] = 0
+    valid[3, 3] = False
+
+    filled = _fill_small_grid_voids(intensity, valid)
+
+    assert filled == 1
+    assert valid[3, 3]
+    assert intensity[3, 3] == expected[3, 3]
+
+
+def test_small_grid_void_fill_closes_multi_cell_holes():
+    intensity = np.full((11, 11), 80, dtype=np.uint8)
+    valid = np.ones(intensity.shape, dtype=bool)
+    intensity[4:7, 4:7] = 0
+    valid[4:7, 4:7] = False
+
+    filled = _fill_small_grid_voids(intensity, valid)
+
+    assert filled == 9
+    assert np.all(valid)
+    np.testing.assert_array_equal(intensity, np.full((11, 11), 80, dtype=np.uint8))
+
+
+def test_small_grid_void_fill_does_not_expand_swath_edges():
+    intensity = np.zeros((9, 9), dtype=np.uint8)
+    valid = np.zeros(intensity.shape, dtype=bool)
+    intensity[2:7, 2:7] = 60
+    valid[2:7, 2:7] = True
+    original_valid = valid.copy()
+
+    filled = _fill_small_grid_voids(intensity, valid)
+
+    assert filled == 0
+    np.testing.assert_array_equal(valid, original_valid)
+
+
+def test_ping_line_interpolation_fills_across_track_stripes():
+    intensity = np.zeros((7, 9), dtype=np.uint8)
+    valid = np.zeros(intensity.shape, dtype=bool)
+    intensity[1, 1:8] = 70
+    intensity[6, 1:8] = 20
+    valid[1, 1:8] = True
+    valid[6, 1:8] = True
+    x = np.tile(np.arange(1.0, 8.0), (2, 1))
+    y = np.array([[1.0] * 7, [6.0] * 7])
+    values = np.array([[20] * 7, [70] * 7], dtype=np.uint8)
+
+    inserted = _deposit_interpolated_ping_lines(
+        x,
+        y,
+        values,
+        np.array([10, 11]),
+        origin_x=0.0,
+        origin_y=7.0,
+        resolution_x=1.0,
+        resolution_y=1.0,
+        intensity=intensity,
+        valid_pixels=valid,
+    )
+
+    assert inserted == 4
+    assert np.all(valid[1:7, 1:8])
+    np.testing.assert_array_equal(intensity[1:7, 4], [70, 60, 50, 40, 30, 20])
+
+
+def test_ping_line_interpolation_does_not_bridge_missing_navigation_pings():
+    intensity = np.zeros((7, 9), dtype=np.uint8)
+    valid = np.zeros(intensity.shape, dtype=bool)
+    intensity[1, 1:8] = 70
+    intensity[6, 1:8] = 20
+    valid[1, 1:8] = True
+    valid[6, 1:8] = True
+    x = np.tile(np.arange(1.0, 8.0), (2, 1))
+    y = np.array([[1.0] * 7, [6.0] * 7])
+    values = np.array([[20] * 7, [70] * 7], dtype=np.uint8)
+
+    inserted = _deposit_interpolated_ping_lines(
+        x,
+        y,
+        values,
+        np.array([10, 12]),
+        origin_x=0.0,
+        origin_y=7.0,
+        resolution_x=1.0,
+        resolution_y=1.0,
+        intensity=intensity,
+        valid_pixels=valid,
+    )
+
+    assert inserted == 0
+    assert not np.any(valid[2:6])
 
 
 def test_proj_database_prefers_active_python_environment_over_quoted_qgis_path(
