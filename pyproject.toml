@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sidescantools"
-version = "1.0.1"
+version = "1.0.2"
 description = "SonarSuite - fast, standalone sidescan sonar processing"
 readme = "README.md"
 requires-python = ">=3.12"
