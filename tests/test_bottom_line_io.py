@@ -94,6 +94,31 @@ def test_save_and_load_flips_order_for_xtf_files(tmp_path):
     )
 
 
+def test_load_bottom_info_rescales_saved_sample_indices(tmp_path):
+    sidescan_file = _SyntheticSidescanFile(
+        tmp_path / "line.rsd", num_ping=3, ping_len=100
+    )
+    preproc = _preprocessor(sidescan_file)
+    npz_path = tmp_path / "line_bottom_info.npz"
+    np.savez(
+        npz_path,
+        bottom_info_port=np.array([2, 3, 4]),
+        bottom_info_star=np.array([5, 6, 7]),
+        downsampling_factor=4,
+    )
+
+    load_bottom_info(npz_path, preproc, sidescan_file)
+
+    np.testing.assert_array_equal(
+        preproc.napari_portside_bottom.flatten()[:3], [8, 12, 16]
+    )
+    np.testing.assert_array_equal(
+        preproc.napari_starboard_bottom.flatten()[:3], [20, 24, 28]
+    )
+    np.testing.assert_array_equal(preproc.portside_bottom_dist, [8, 12, 16])
+    np.testing.assert_array_equal(preproc.starboard_bottom_dist, [20, 24, 28])
+
+
 def test_load_bottom_info_raises_for_a_missing_file(tmp_path):
     sidescan_file = _SyntheticSidescanFile(tmp_path / "line.jsf")
     preproc = _preprocessor(sidescan_file)

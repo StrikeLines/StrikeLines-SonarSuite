@@ -29,6 +29,27 @@ class PreprocessorDownsamplingTests(unittest.TestCase):
         self.assertEqual(preprocessor.ping_len, 32)
         self.assertEqual(preprocessor.num_chunk, 4)
 
+    def test_reader_can_preserve_a_minimum_processed_sample_width(self):
+        source = SyntheticSidescanFile()
+        generator = np.random.default_rng(7)
+        source.data = generator.integers(
+            1, 1000, size=(2, 3, 2048), dtype=np.int16
+        )
+        source.ping_len = 2048
+        source.reader_metadata = {
+            "minimum_processed_samples_per_channel": 512
+        }
+
+        preprocessor = SidescanPreprocessor(
+            source,
+            chunk_size=3,
+            downsampling_factor=32,
+        )
+
+        self.assertEqual(preprocessor.downsampling_factor, 4)
+        self.assertEqual(preprocessor.ping_len, 512)
+        self.assertEqual(preprocessor.sonar_data_proc.shape, (2, 3, 512))
+
     def test_bottom_edge_tracking_accepts_a_clicked_start_position(self):
         edges = np.zeros((3, 20), dtype=bool)
         edges[:, 12] = True

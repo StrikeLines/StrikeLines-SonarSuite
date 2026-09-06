@@ -130,6 +130,29 @@ def load_bottom_info(
     with np.load(path) as bottom_info:
         napari_portside_bottom = bottom_info["bottom_info_port"].flatten().copy()
         napari_starboard_bottom = bottom_info["bottom_info_star"].flatten().copy()
+        saved_factor = int(
+            np.asarray(
+                bottom_info.get(
+                    "downsampling_factor", preproc.downsampling_factor
+                )
+            ).reshape(-1)[0]
+        )
+    if saved_factor < 1:
+        raise ValueError("Saved bottom-line downsampling factor must be positive")
+    if saved_factor != preproc.downsampling_factor:
+        scale = saved_factor / preproc.downsampling_factor
+        napari_portside_bottom = np.rint(
+            napari_portside_bottom * scale
+        ).astype(int)
+        napari_starboard_bottom = np.rint(
+            napari_starboard_bottom * scale
+        ).astype(int)
+        napari_portside_bottom = np.clip(
+            napari_portside_bottom, 0, preproc.ping_len - 1
+        )
+        napari_starboard_bottom = np.clip(
+            napari_starboard_bottom, 0, preproc.ping_len - 1
+        )
     if getattr(sidescan_file, "bottom_line_storage_reversed", False):
         napari_portside_bottom[: sidescan_file.num_ping] = np.flip(
             napari_portside_bottom[: sidescan_file.num_ping]

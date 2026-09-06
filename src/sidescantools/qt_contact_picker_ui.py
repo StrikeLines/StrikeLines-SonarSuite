@@ -96,7 +96,10 @@ from sidescantools.readers import (
     sonar_file_dialog_filter,
 )
 from sidescantools.sidescan_file import SidescanFile
-from sidescantools.sidescan_preproc import SidescanPreprocessor
+from sidescantools.sidescan_preproc import (
+    SidescanPreprocessor,
+    resolve_downsampling_factor,
+)
 from sidescantools.swath_geometry import GeometrySettings
 
 
@@ -764,12 +767,15 @@ def _load_sonar_context(
         tow_data,
         manual_layback_m=layback_override_m,
     )
+    downsampling_factor = resolve_downsampling_factor(
+        sidescan_file, settings.downsampling_factor
+    )
     preprocessor = SidescanPreprocessor(
         sidescan_file=sidescan_file,
         chunk_size=settings.chunk_size,
-        downsampling_factor=settings.downsampling_factor,
+        downsampling_factor=downsampling_factor,
     )
-    depth_info = compute_depth_info(sidescan_file, settings.downsampling_factor)
+    depth_info = compute_depth_info(sidescan_file, downsampling_factor)
     preprocessor.init_napari_bottom_detect(
         settings.default_threshold,
         active_dB=settings.active_dB,

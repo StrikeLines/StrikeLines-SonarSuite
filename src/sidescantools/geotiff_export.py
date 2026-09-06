@@ -36,7 +36,10 @@ from sidescantools.gain_settings import (
 from sidescantools.georef_thread import Georeferencer
 from sidescantools.layback import resolve_geometry_layback, summarize_tow_data
 from sidescantools.sidescan_file import SidescanFile
-from sidescantools.sidescan_preproc import SidescanPreprocessor
+from sidescantools.sidescan_preproc import (
+    SidescanPreprocessor,
+    resolve_downsampling_factor,
+)
 from sidescantools.swath_geometry import GeometrySettings, SwathGeometry
 
 
@@ -378,6 +381,9 @@ def prepare_sonar_export(
         geometry_settings,
         summarize_tow_data(sidescan_file),
         manual_layback_m=settings.layback_override_m,
+    )
+    downsampling_factor = resolve_downsampling_factor(
+        sidescan_file, downsampling_factor
     )
     preprocessor = SidescanPreprocessor(
         sidescan_file=sidescan_file,

@@ -10,6 +10,27 @@ import geopy.distance as geo_dist
 from sidescantools.aux_functions import convert_to_dB, hist_equalization
 
 
+def resolve_downsampling_factor(sidescan_file, requested_factor: int) -> int:
+    """Honor a reader's minimum useful across-track resolution.
+
+    Some compact formats already store a modest number of samples per ping.
+    Applying the legacy GUI default of 32 to those files makes the waterfall
+    visibly blocky and magnifies source-pixel overlays. Readers may therefore
+    advertise a minimum processed width in ``reader_metadata``.
+    """
+
+    requested_factor = int(requested_factor)
+    if requested_factor < 1:
+        raise ValueError("downsampling_factor must be positive")
+    metadata = getattr(sidescan_file, "reader_metadata", {}) or {}
+    minimum_width = metadata.get("minimum_processed_samples_per_channel")
+    if minimum_width is None:
+        return requested_factor
+    minimum_width = max(1, int(minimum_width))
+    max_factor = max(1, int(sidescan_file.ping_len) // minimum_width)
+    return min(requested_factor, max_factor)
+
+
 class SidescanPreprocessor:
     """Main class to apply preprocessing functionalities to sidescan sonar data:
     - Init by loading a SidescanFile with desired parameters
@@ -59,13 +80,15 @@ class SidescanPreprocessor:
         self.chunk_size = chunk_size
         self.ping_len = self.sidescan_file.ping_len
         self.num_ch = num_ch
-        self.downsampling_factor = downsampling_factor
+        self.downsampling_factor = resolve_downsampling_factor(
+            sidescan_file, downsampling_factor
+        )
         source_data = np.asarray(self.sidescan_file.data)
         self.num_chunk = int(np.ceil(source_data.shape[1] / self.chunk_size))
 
         # store old minimal but positive value that might be needed later if filter introduce negative values
         self.pre_dec_least_val = np.min(source_data[np.where(source_data > 0)])
-        if downsampling_factor != 1:
+        if self.downsampling_factor != 1:
             pre_dec_min = np.min(source_data)
             downsampled_width = int(
                 np.ceil(self.ping_len / self.downsampling_factor)
@@ -80,7 +103,7 @@ class SidescanPreprocessor:
                 ping_stop = min(ping_start + self.chunk_size, source_data.shape[1])
                 decimated = scisig.decimate(
                     np.asarray(source_data[:, ping_start:ping_stop], dtype=float),
-                    downsampling_factor,
+                    self.downsampling_factor,
                     axis=2,
                 )
                 self.sonar_data_proc[:, ping_start:ping_stop] = np.clip(

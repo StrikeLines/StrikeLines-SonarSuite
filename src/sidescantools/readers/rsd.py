@@ -541,6 +541,10 @@ class RSDReader:
                 "rsd_version": header.version,
                 "port_channel_id": port[0].channel_id,
                 "starboard_channel_id": starboard[0].channel_id,
+                # The GUI's legacy 32x reduction leaves only 64 samples from
+                # a typical 2048-sample Garmin ping. Preserve enough bins for
+                # contact shapes and bottom overlays to remain well resolved.
+                "minimum_processed_samples_per_channel": 512,
                 "port_sequence_count": np.asarray(
                     [record.sequence_count for record in port], dtype=np.uint32
                 ),

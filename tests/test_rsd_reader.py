@@ -174,6 +174,7 @@ def test_rsd_reader_normalizes_sidevu_orientation_and_metadata(tmp_path):
     assert dataset.timestamp[0] == datetime(2025, 3, 25, 0, 0, 0, 101000)
     assert dataset.reader_metadata["port_channel_id"] == 10
     assert dataset.reader_metadata["starboard_channel_id"] == 11
+    assert dataset.reader_metadata["minimum_processed_samples_per_channel"] == 512
 
 
 def test_rsd_reader_rejects_non_sidevu_and_bad_magic(tmp_path):
