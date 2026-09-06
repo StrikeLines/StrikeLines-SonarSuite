@@ -411,9 +411,9 @@ class PreProcWorker(QtCore.QRunnable):
             chunk_size=self.chunk_size,
             downsampling_factor=downsampling_factor,
         )
-        # flip order for xtf files to contain backwards compability
+        # Preserve any reader-specific legacy bottom-line sidecar ordering.
         if not self.active_internal_altitude:
-            if self.filepath.suffix.casefold() == ".xtf":
+            if sidescan_file.bottom_line_storage_reversed:
                 portside_bottom_dist = np.flip(portside_bottom_dist)
                 starboard_bottom_dist = np.flip(starboard_bottom_dist)
 

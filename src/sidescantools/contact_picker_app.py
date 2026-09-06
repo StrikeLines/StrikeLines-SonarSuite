@@ -7,19 +7,20 @@ from pathlib import Path
 import sys
 
 from sidescantools.swath_geometry import GeometrySettings
+from sidescantools.readers import is_supported_sonar_path
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sidescantools-contacts",
-        description="Open a JSF or XTF waterfall for bottom editing and contact picking.",
+        description="Open a sidescan waterfall for bottom editing and contact picking.",
     )
     parser.add_argument(
         "sonar_file",
         type=Path,
         nargs="?",
         default=None,
-        help="input .jsf or .xtf file (omit to open an empty Qt workspace)",
+        help="input sonar file (omit to open an empty Qt workspace)",
     )
     parser.add_argument(
         "--work-dir",
@@ -65,8 +66,8 @@ def main(argv: list[str] | None = None) -> None:
     if sonar_file is not None:
         if not sonar_file.is_file():
             parser.error(f"input file does not exist: {sonar_file}")
-        if sonar_file.suffix.casefold() not in {".jsf", ".xtf"}:
-            parser.error("input file must have a .jsf or .xtf extension")
+        if not is_supported_sonar_path(sonar_file):
+            parser.error("input file must use a registered sonar format")
     elif viewer_backend != "qt":
         parser.error("sonar_file is required unless --viewer qt is used")
     if arguments.chunk_size < 1:

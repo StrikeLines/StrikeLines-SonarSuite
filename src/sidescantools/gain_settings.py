@@ -129,7 +129,7 @@ class SonarGainSettings:
 
 
 def gain_settings_path(sonar_path: str | os.PathLike) -> Path:
-    """Return the unambiguous sidecar path for a JSF/XTF source file."""
+    """Return the unambiguous sidecar path for a source sonar file."""
 
     sonar_path = Path(sonar_path)
     return sonar_path.with_name(sonar_path.name + SIDECAR_SUFFIX)

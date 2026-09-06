@@ -26,6 +26,7 @@ class _SyntheticSidescanFile:
         self.ping_len = ping_len
         self.num_ping = num_ping
         self.filepath = Path(filepath)
+        self.bottom_line_storage_reversed = self.filepath.suffix.casefold() == ".xtf"
         self.ping_x_axis = np.linspace(0.0, 10.0, ping_len)
         self.depth = np.full(num_ping, 4.0)
 

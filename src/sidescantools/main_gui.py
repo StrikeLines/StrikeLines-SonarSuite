@@ -54,6 +54,7 @@ import scipy.signal as scisig
 from sidescantools.cfg_parser import GAINSTRAT, CFG
 from sidescantools.georef_thread import Georeferencer
 from sidescantools.sidescan_file import SidescanFile
+from sidescantools.readers import sonar_file_dialog_filter
 
 
 class SidescanToolsMain(QWidget):
@@ -83,8 +84,8 @@ class SidescanToolsMain(QWidget):
         title_font = QtGui.QFont()
         title_font.setBold(True)
 
-        # File picker for JSF/XTF reading
-        self.file_pick_btn = QPushButton("Add XTF/JSF file")
+        # File picker for every registered sonar reader.
+        self.file_pick_btn = QPushButton("Add sonar file")
         self.file_pick_btn.clicked.connect(self.pick_new_files)
 
         self.file_table = QTableWidget()
@@ -256,7 +257,7 @@ class SidescanToolsMain(QWidget):
         file_picker = QFileDialog()
         file_picker.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
         file_picker.setFileMode(QFileDialog.FileMode.ExistingFiles)
-        file_picker.setNameFilter("*.xtf *.jsf")
+        file_picker.setNameFilters(sonar_file_dialog_filter().split(";;"))
 
         if file_picker.exec_():
             filenames = file_picker.selectedFiles()

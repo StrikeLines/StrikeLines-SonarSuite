@@ -103,9 +103,8 @@ def generate_egn_info(
         starboard_bottom_dist = bottom_info["bottom_info_star"].flatten()[
             : sidescan_file.num_ping
         ]
-        # flip order for xtf files to contain backwards compability
-        filepath = pathlib.Path(filename)
-        if filepath.suffix.casefold() == ".xtf":
+        # Preserve any reader-specific legacy bottom-line sidecar ordering.
+        if sidescan_file.bottom_line_storage_reversed:
             portside_bottom_dist = np.flip(portside_bottom_dist)
             starboard_bottom_dist = np.flip(starboard_bottom_dist)
 

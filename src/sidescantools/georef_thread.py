@@ -522,7 +522,7 @@ class Georeferencer:
         ch_stack /= np.max(np.abs(ch_stack)) / 254
         ch_stack = np.clip(ch_stack, 1, 255)
 
-        # Flip array ---> Note: different for .jsf and .xtf!
+        # Channel 0 is normalized as port by every registered reader.
         if self.channel == 0:
             ch_stack = np.flip(ch_stack, axis=1)
 
@@ -689,7 +689,7 @@ class Georeferencer:
 
 def main():
     parser = argparse.ArgumentParser(description="Tool to process sidescan sonar data")
-    parser.add_argument("xtf", metavar="FILE", help="Path to xtf/jsf file")
+    parser.add_argument("xtf", metavar="FILE", help="Path to a supported sonar file")
     parser.add_argument(
         "channel",
         type=int,

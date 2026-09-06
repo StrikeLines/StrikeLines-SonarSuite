@@ -101,8 +101,9 @@ def save_bottom_info(
                 info_star[ping_idx] = int(
                     (info_star[ping_idx - 1] + info_star[ping_idx + 1]) / 2
                 )
-    # flip order for xtf files to contain backwards compability
-    if sidescan_file.filepath.suffix.casefold() == ".xtf":
+    # Some reader adapters retain a legacy sidecar ping ordering for backward
+    # compatibility. The format-specific decision belongs to the adapter.
+    if getattr(sidescan_file, "bottom_line_storage_reversed", False):
         info_port = np.flip(info_port)
         info_star = np.flip(info_star)
     np.savez(
@@ -129,8 +130,7 @@ def load_bottom_info(
     with np.load(path) as bottom_info:
         napari_portside_bottom = bottom_info["bottom_info_port"].flatten().copy()
         napari_starboard_bottom = bottom_info["bottom_info_star"].flatten().copy()
-    # flip order for xtf files to contain backwards compability
-    if sidescan_file.filepath.suffix.casefold() == ".xtf":
+    if getattr(sidescan_file, "bottom_line_storage_reversed", False):
         napari_portside_bottom[: sidescan_file.num_ping] = np.flip(
             napari_portside_bottom[: sidescan_file.num_ping]
         )

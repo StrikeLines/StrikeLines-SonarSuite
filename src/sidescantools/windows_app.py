@@ -8,8 +8,7 @@ from pathlib import Path
 import sys
 import traceback
 
-
-SUPPORTED_SONAR_SUFFIXES = {".jsf", ".xtf"}
+from sidescantools.readers import is_supported_sonar_path
 
 
 def startup_sonar_file(arguments: list[str]) -> Path | None:
@@ -18,7 +17,7 @@ def startup_sonar_file(arguments: list[str]) -> Path | None:
     if not arguments:
         return None
     candidate = Path(arguments[0]).expanduser()
-    if candidate.is_file() and candidate.suffix.casefold() in SUPPORTED_SONAR_SUFFIXES:
+    if candidate.is_file() and is_supported_sonar_path(candidate):
         return candidate.resolve()
     return None
 

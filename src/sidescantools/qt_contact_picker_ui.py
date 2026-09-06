@@ -91,6 +91,10 @@ from sidescantools.layback import (
     resolve_geometry_layback,
     summarize_tow_data,
 )
+from sidescantools.readers import (
+    is_supported_sonar_path,
+    sonar_file_dialog_filter,
+)
 from sidescantools.sidescan_file import SidescanFile
 from sidescantools.sidescan_preproc import SidescanPreprocessor
 from sidescantools.swath_geometry import GeometrySettings
@@ -452,7 +456,7 @@ class EGNTableBuilderDialog(QDialog):
         button_row.addWidget(self.close_button)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Sonar files (.jsf / .xtf)"))
+        layout.addWidget(QLabel("Supported sonar files"))
         layout.addWidget(self.file_list, 1)
         layout.addLayout(file_buttons)
         layout.addLayout(form)
@@ -465,7 +469,7 @@ class EGNTableBuilderDialog(QDialog):
             self,
             "Select sidescan files",
             str(self._initial_directory),
-            "Sidescan files (*.jsf *.xtf);;All files (*)",
+            sonar_file_dialog_filter(),
         )
         self._add_paths(Path(name) for name in filenames)
 
@@ -478,10 +482,10 @@ class EGNTableBuilderDialog(QDialog):
         found = sorted(
             path
             for path in Path(directory).rglob("*")
-            if path.is_file() and path.suffix.casefold() in (".jsf", ".xtf")
+            if path.is_file() and is_supported_sonar_path(path)
         )
         if not found:
-            self.status_label.setText(f"No .jsf/.xtf files found under {directory}")
+            self.status_label.setText(f"No supported sonar files found under {directory}")
             return
         self._add_paths(found)
 
@@ -638,11 +642,8 @@ def logical_bottom_overlay(preprocessor, source_ping_count: int) -> np.ndarray:
     )
 
 
-SONAR_FILE_SUFFIXES = (".jsf", ".xtf")
-
-
 def sonar_files_in_directory(directory: str | os.PathLike) -> list[Path]:
-    """List .jsf/.xtf files directly inside a directory, sorted by name.
+    """List registered sonar files directly inside a directory, sorted by name.
 
     Not recursive -- survey exports are conventionally one flat folder of
     line files, and this backs the Qt picker's "next/previous file"
@@ -656,7 +657,7 @@ def sonar_files_in_directory(directory: str | os.PathLike) -> list[Path]:
     return sorted(
         path
         for path in directory.iterdir()
-        if path.is_file() and path.suffix.casefold() in SONAR_FILE_SUFFIXES
+        if path.is_file() and is_supported_sonar_path(path)
     )
 
 
@@ -1679,7 +1680,7 @@ class QtContactPickerWindow(QMainWindow):
         self.previous_file_button.clicked.connect(lambda: self._go_to_relative_file(-1))
         self.next_file_button = QPushButton("Next file ▶")
         self.next_file_button.setToolTip(
-            "Move to the next .jsf/.xtf file in this folder. Gain, TVG, and "
+            "Move to the next supported sonar file in this folder. Gain, TVG, and "
             "along-track scale carry over; the same contacts database is used."
         )
         self.next_file_button.clicked.connect(lambda: self._go_to_relative_file(1))
@@ -2023,7 +2024,7 @@ class QtContactPickerWindow(QMainWindow):
             self,
             "Open sonar file",
             start_dir,
-            "Sidescan files (*.jsf *.xtf);;All files (*)",
+            sonar_file_dialog_filter(),
         )
         if filename:
             self.load_file(Path(filename))
@@ -2293,7 +2294,7 @@ class QtContactPickerWindow(QMainWindow):
         )
         self.export_directory_geotiff_button.setMinimumHeight(36)
         self.export_directory_geotiff_button.setToolTip(
-            "Export every .jsf/.xtf file in one folder using each file's own "
+            "Export every supported sonar file in one folder using each file's own "
             ".tvg_gain.cfg sidecar."
         )
         self.export_directory_geotiff_button.clicked.connect(
@@ -2363,7 +2364,7 @@ class QtContactPickerWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "No sonar files",
-                "The selected directory contains no .jsf or .xtf files.",
+                "The selected directory contains no supported sonar files.",
             )
             return
 
@@ -3401,7 +3402,7 @@ class QtContactPickerStartWindow(QMainWindow):
         file_nav.addWidget(self.file_position_label, 1)
 
         prompt = QLabel(
-            "Open a JSF or XTF sidescan file to display its waterfall and "
+            "Open a supported sidescan sonar file to display its waterfall and "
             "enable processing, contacts, and export tools."
         )
         prompt.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3440,16 +3441,16 @@ class QtContactPickerStartWindow(QMainWindow):
             self,
             "Open sonar file",
             start_dir,
-            "Sidescan files (*.jsf *.xtf);;All files (*)",
+            sonar_file_dialog_filter(),
         )
         if not filename:
             return
         filepath = Path(filename)
-        if filepath.suffix.casefold() not in {".jsf", ".xtf"}:
+        if not is_supported_sonar_path(filepath):
             QMessageBox.warning(
                 self,
                 "Unsupported sonar file",
-                "Select a JSF or XTF sidescan file.",
+                "Select a supported sidescan sonar file.",
             )
             return
         self.statusBar().showMessage(f"Loading {filepath.name}…")

@@ -87,7 +87,8 @@ sidescantools-contacts --viewer qt
 
 The GUI can start without a sonar filename; use its **Open** controls to select
 a JSF or XTF file. Windows release maintainers can also follow the
-[release build instructions](docs/windows-release.md).
+[release build instructions](docs/windows-release.md). Developers adding an
+input type should follow the [sonar reader adapter contract](docs/adding-sonar-format.md).
 
 ## Project and support
 

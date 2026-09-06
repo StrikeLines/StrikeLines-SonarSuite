@@ -45,7 +45,7 @@ class SidescanPreprocessor:
         Parameters
         ----------
         sidescan_file: SidescanFile
-            Reference to SidescanFile class that holds a loaded sidescan data file (XTF/JSF)
+            Format-neutral loaded sonar dataset exposed through SidescanFile.
         chunk_size: int
             Number of pings per single chunk
         num_ch: int
@@ -75,7 +75,7 @@ class SidescanPreprocessor:
                 dtype=float,
             )
             # Filtering is independent for each ping. Work in along-track chunks
-            # to avoid a multi-gigabyte temporary float copy for large JSF files.
+            # to avoid a multi-gigabyte temporary float copy for large sonar files.
             for ping_start in range(0, source_data.shape[1], self.chunk_size):
                 ping_stop = min(ping_start + self.chunk_size, source_data.shape[1])
                 decimated = scisig.decimate(

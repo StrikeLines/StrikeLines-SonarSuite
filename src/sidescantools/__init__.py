@@ -12,6 +12,22 @@ from typing import Any
 _PUBLIC_IMPORTS = {
     "SidescanPreprocessor": ("sidescantools.sidescan_preproc", "SidescanPreprocessor"),
     "SidescanFile": ("sidescantools.sidescan_file", "SidescanFile"),
+    "SonarDataset": ("sidescantools.readers", "SonarDataset"),
+    "SonarReader": ("sidescantools.readers", "SonarReader"),
+    "SonarReaderRegistry": ("sidescantools.readers", "SonarReaderRegistry"),
+    "UnsupportedSonarFormatError": (
+        "sidescantools.readers",
+        "UnsupportedSonarFormatError",
+    ),
+    "register_sonar_reader": ("sidescantools.readers", "register_sonar_reader"),
+    "unregister_sonar_reader": (
+        "sidescantools.readers",
+        "unregister_sonar_reader",
+    ),
+    "supported_sonar_suffixes": (
+        "sidescantools.readers",
+        "supported_sonar_suffixes",
+    ),
     "Georeferencer": ("sidescantools.georef_thread", "Georeferencer"),
     "generate_egn_info": ("sidescantools.egn_table_build", "generate_egn_info"),
     "generate_egn_table_from_infos": (

@@ -2,6 +2,7 @@ from pathlib import Path
 import argparse
 import numpy as np
 from sidescantools.sidescan_file import SidescanFile
+from sidescantools.readers import is_supported_sonar_path, supported_sonar_suffixes
 from sidescantools.sidescan_preproc import SidescanPreprocessor
 from sidescantools.georef_thread import Georeferencer
 from sidescantools.aux_functions import convert_to_dB, hist_equalization
@@ -33,17 +34,25 @@ class SidescanToolsMain:
         self.active_georef = not no_georef
         # Check input sidescan file path
         if self.filepath.is_dir():
-            self.sidescan_files_path = []
-            for f_path in list(self.filepath.glob("*.xtf")):
-                self.sidescan_files_path.append(f_path)
-            for f_path in list(self.filepath.glob("*.jsf")):
-                self.sidescan_files_path.append(f_path)
+            self.sidescan_files_path = sorted(
+                path
+                for path in self.filepath.iterdir()
+                if path.is_file() and is_supported_sonar_path(path)
+            )
         elif self.filepath.is_file():
+            if not is_supported_sonar_path(self.filepath):
+                supported = ", ".join(supported_sonar_suffixes())
+                raise ValueError(
+                    f"File type {self.filepath.suffix or '<none>'} is not supported. "
+                    f"Supported extensions: {supported}."
+                )
             self.sidescan_files_path = [self.filepath]
         else:
             raise ValueError(
                 f"Argument path: {self.filepath} is not a valid directory or file."
             )
+        if not self.sidescan_files_path:
+            raise ValueError(f"No supported sonar files found in {self.filepath}.")
 
         # Read CFG
         self.cfg = CFG()
@@ -331,7 +340,7 @@ def main():
     parser.add_argument(
         "filepath",
         metavar="FILE",
-        help="Path to xtf/jsf file or dir containing multiple files",
+        help="Path to a supported sonar file or directory containing sonar files",
     )
     parser.add_argument(
         "cfg",
