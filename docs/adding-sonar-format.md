@@ -29,6 +29,10 @@ then recognize its extensions automatically. If the reader needs another
 third-party parser, also include that package in the project dependencies and
 Windows build specification.
 
+The built-in adapters currently cover EdgeTech JSF, XTF, and Garmin RSD. The
+RSD adapter is also an example of keeping a vendor-specific binary decoder and
+its SideVü channel selection entirely inside one reader module.
+
 Add reader tests using a small representative source file or mocked vendor
 packets. Every adapter should also pass the shared `SonarDataset` validation
 before its data reaches processing.

@@ -5,6 +5,7 @@ import pytest
 
 from sidescantools.readers import (
     JSFReader,
+    RSDReader,
     SonarDataset,
     SonarReaderRegistry,
     UnsupportedSonarFormatError,
@@ -65,7 +66,8 @@ class _SyntheticReader:
 def test_builtin_readers_are_registered_as_independent_adapters():
     assert isinstance(sonar_reader_registry.reader_for("line.JSF"), JSFReader)
     assert isinstance(sonar_reader_registry.reader_for("line.xtf"), XTFReader)
-    assert supported_sonar_suffixes() == (".jsf", ".xtf")
+    assert isinstance(sonar_reader_registry.reader_for("line.RSD"), RSDReader)
+    assert supported_sonar_suffixes() == (".jsf", ".xtf", ".rsd")
 
 
 def test_registry_dispatches_case_insensitively_and_normalizes_suffixes(tmp_path):

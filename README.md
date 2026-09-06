@@ -11,8 +11,8 @@ desktop workflow for field processing, target review, and GIS-ready exports.
 SonarSuite was forked from the excellent
 [SidescanTools](https://github.com/sonoware/sidescantools) package.
 
-SonarSuite currently supports **JSF** (`.jsf`) and **XTF** (`.xtf`) sonar files.
-Support for additional formats is planned.
+SonarSuite currently supports **JSF** (`.jsf`), **XTF** (`.xtf`), and Garmin
+**RSD** (`.rsd`) sonar files. Support for additional formats is planned.
 
 **[Download SonarSuite for Windows](https://github.com/StrikeLines/StrikeLines-SonarSuite/releases/latest/download/SidescanTools-Windows-x64.zip)**
 
@@ -24,7 +24,7 @@ New user? Jump to the [Windows Setup Quickstart](#windows-setup-quickstart).
 
 SonarSuite supports the complete GUI-based side-scan workflow:
 
-- Import individual JSF or XTF files and move between survey lines.
+- Import individual JSF, XTF, or Garmin RSD files and move between survey lines.
 - Review continuous port and starboard data in the waterfall viewer.
 - Automatically calculate, manually edit, and save the bottom track.
 - Read recorded cable-out or layback and apply a manual layback override.
@@ -86,7 +86,7 @@ sidescantools-contacts --viewer qt
 ```
 
 The GUI can start without a sonar filename; use its **Open** controls to select
-a JSF or XTF file. Windows release maintainers can also follow the
+a JSF, XTF, or Garmin RSD file. Windows release maintainers can also follow the
 [release build instructions](docs/windows-release.md). Developers adding an
 input type should follow the [sonar reader adapter contract](docs/adding-sonar-format.md).
 
