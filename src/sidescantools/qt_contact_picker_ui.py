@@ -3372,7 +3372,9 @@ class QtContactPickerWindow(QMainWindow):
         self.preprocessor.bottom_map = processor_copy.bottom_map
         self._refresh_bottom_overlay()
         self._set_bottom_controls_enabled(True)
-        self.bottom_status_label.setText("Bottom line updated" + self._blanking_warning())
+        self.bottom_status_label.setText(
+            "Bottom line updated" + self._blanking_warning()
+        )
         self._mark_bottom_line_dirty()
 
     def _bottom_recalc_failed(self, message: str) -> None:
