@@ -13,8 +13,8 @@ import pytest
 
 from sidescantools.sidescan_preproc import (
     SidescanPreprocessor,
-    bottom_candidates,
     bottom_dp_path,
+    bottom_sample_costs,
     bottom_step_scores,
 )
 
@@ -84,50 +84,89 @@ def test_step_score_ignores_samples_without_a_full_window_each_side():
     assert np.isfinite(scores[:, PING_LEN // 2]).all()
 
 
-def test_candidates_stay_outside_the_blanked_span():
+def test_blanked_samples_cost_more_than_any_real_one():
     source = _flat()
     scores = bottom_step_scores(source.data[1].astype(float))
 
-    indices, _costs = bottom_candidates(scores, blank_samples=90)
+    costs = bottom_sample_costs(scores, blank_samples=90)
 
-    assert indices.min() >= 90
+    window = max(3, int(round(0.01 * PING_LEN)))
+    assert (costs[:, :90] > 1.0).all()
+    # The last `window` samples carry no score either, so compare the interior.
+    assert costs[:, 90 : PING_LEN - window].max() <= 1.0
 
 
-def test_candidates_survive_blanking_that_covers_the_whole_ping():
+def test_costs_stay_finite_when_blanking_covers_the_whole_ping():
     source = _flat()
     scores = bottom_step_scores(source.data[1].astype(float))
 
-    indices, costs = bottom_candidates(scores, blank_samples=PING_LEN + 50)
+    costs = bottom_sample_costs(scores, blank_samples=PING_LEN + 50)
 
-    # Nowhere legal left to look, but every ping must still yield an answer.
-    assert indices.shape[0] == PING_COUNT
+    # Nowhere legal left to look, but the search must still be solvable.
+    assert costs.shape == (PING_COUNT, PING_LEN)
     assert np.isfinite(costs).all()
 
 
-def test_path_search_prefers_the_cheaper_candidate_when_smoothing_is_off():
-    indices = np.array([[10, 200], [10, 200], [10, 200]])
-    costs = np.array([[0.0, 1.0], [1.0, 0.0], [0.0, 1.0]])
+def _two_well_costs():
+    """Three pings, cheap at sample 0 except the middle one, cheap at sample 9."""
 
-    path, _cost = bottom_dp_path(indices, costs, smoothing_weight=0.0)
+    costs = np.ones((3, 10))
+    costs[0, 0] = costs[2, 0] = 0.0
+    costs[1, 9] = 0.0
+    return costs
 
-    np.testing.assert_array_equal(path, [10, 200, 10])
+
+def test_path_search_follows_the_data_when_smoothing_is_off():
+    path, _cost = bottom_dp_path(_two_well_costs(), smoothing_weight=0.0)
+
+    np.testing.assert_array_equal(path, [0, 9, 0])
 
 
 def test_path_search_rides_over_a_single_outlier_when_smoothing_is_on():
-    indices = np.array([[10, 200], [10, 200], [10, 200]])
-    # The middle ping's evidence favours the far candidate, but only just.
-    costs = np.array([[0.0, 1.0], [1.0, 0.0], [0.0, 1.0]])
+    path, _cost = bottom_dp_path(_two_well_costs(), smoothing_weight=1.0)
 
-    path, _cost = bottom_dp_path(indices, costs, smoothing_weight=50.0)
+    np.testing.assert_array_equal(path, [0, 0, 0])
 
-    np.testing.assert_array_equal(path, [10, 10, 10])
+
+def test_path_search_matches_an_exhaustive_search():
+    """The linear-time min-convolution must agree with comparing every pair."""
+
+    generator = np.random.default_rng(11)
+    for _ in range(60):
+        pings = int(generator.integers(2, 12))
+        samples = int(generator.integers(2, 25))
+        costs = generator.random((pings, samples)) * generator.choice([1.0, 10.0])
+        weight = float(generator.choice([0.0, 0.01, 0.2, 1.0, 5.0]))
+
+        fast, _cost = bottom_dp_path(costs, weight)
+
+        index = np.arange(samples)
+        total = costs[0].copy()
+        back = np.zeros((pings, samples), dtype=int)
+        for ping in range(1, pings):
+            step = total[:, None] + weight * np.abs(index[None, :] - index[:, None])
+            previous = np.argmin(step, axis=0)
+            total = step[previous, index] + costs[ping]
+            back[ping] = previous
+        slow = np.zeros(pings, dtype=int)
+        cursor = int(np.argmin(total))
+        for ping in range(pings - 1, -1, -1):
+            slow[ping] = cursor
+            cursor = int(back[ping, cursor])
+
+        def path_cost(path):
+            return costs[np.arange(pings), path].sum() + weight * np.abs(
+                np.diff(path)
+            ).sum()
+
+        assert path_cost(fast) == pytest.approx(path_cost(slow))
 
 
 def test_detector_finds_a_flat_bottom_on_both_channels():
     source = _flat(altitude=70)
     preprocessor = _preprocessor(source)
 
-    preprocessor.detect_bottom_line(blanking_m=0.0, smoothing=2.0)
+    preprocessor.detect_bottom_line(blanking_m=0.0, smoothing=0.10)
 
     # Starboard counts from nadir; port counts from the outer range.
     assert abs(int(np.median(preprocessor.starboard_bottom_dist)) - 70) <= 3
@@ -138,7 +177,7 @@ def test_detector_follows_a_sloping_bottom():
     altitudes = np.linspace(50, 150, PING_COUNT).astype(int)
     preprocessor = _preprocessor(SyntheticSidescanFile(altitudes))
 
-    preprocessor.detect_bottom_line(blanking_m=0.0, smoothing=2.0)
+    preprocessor.detect_bottom_line(blanking_m=0.0, smoothing=0.10)
 
     error = preprocessor.starboard_bottom_dist - altitudes
     assert np.abs(np.median(error)) <= 3
@@ -155,7 +194,7 @@ def test_smoothing_suppresses_a_water_column_false_target():
     preprocessor.detect_bottom_line(blanking_m=0.0, smoothing=0.0)
     unsmoothed = preprocessor.starboard_bottom_dist[58:63].copy()
 
-    preprocessor.detect_bottom_line(blanking_m=0.0, smoothing=60.0)
+    preprocessor.detect_bottom_line(blanking_m=0.0, smoothing=0.5)
     smoothed = preprocessor.starboard_bottom_dist[58:63]
 
     # Without smoothing the blob captures the line; with it the line holds.
@@ -189,7 +228,7 @@ def test_detector_never_collapses_onto_a_constant():
     altitudes = np.full(PING_COUNT, 90)
     preprocessor = _preprocessor(SyntheticSidescanFile(altitudes))
 
-    for smoothing in (0.0, 0.1, 0.49, 0.5, 0.51, 1.0, 5.0, 25.0, 100.0, 1000.0):
+    for smoothing in (0.0, 0.01, 0.1, 0.49, 0.5, 0.51, 1.0, 5.0, 100.0, 1000.0):
         preprocessor.detect_bottom_line(blanking_m=0.0, smoothing=smoothing)
         starboard = preprocessor.starboard_bottom_dist
         port = preprocessor.portside_bottom_dist
@@ -237,7 +276,7 @@ def test_data_cost_flags_pings_chosen_on_continuity():
     source.add_water_column_blob(pings=range(58, 63), sample=40)
     preprocessor = _preprocessor(source)
 
-    cost = preprocessor.detect_bottom_line(blanking_m=0.0, smoothing=60.0)
+    cost = preprocessor.detect_bottom_line(blanking_m=0.0, smoothing=0.5)
 
     assert cost.shape == (2, PING_COUNT)
     # The pings whose own evidence was overruled cost more than quiet ones.
@@ -265,6 +304,40 @@ def test_blanking_is_measured_in_meters_not_samples():
 def test_detector_is_accurate_across_depths(altitude):
     preprocessor = _preprocessor(_flat(altitude=altitude))
 
-    preprocessor.detect_bottom_line(blanking_m=0.0, smoothing=2.0)
+    preprocessor.detect_bottom_line(blanking_m=0.0, smoothing=0.10)
 
     assert abs(int(np.median(preprocessor.starboard_bottom_dist)) - altitude) <= 4
+
+
+def test_maximum_smoothing_still_follows_a_real_slope():
+    """The top of the slider must not iron out genuine depth change.
+
+    A weight of 1 makes one sample of movement cost the whole data-cost range,
+    which is where the line stops tracking the seafloor. The slider stops
+    there, so the maximum has to remain usable.
+    """
+
+    altitudes = np.linspace(50, 150, PING_COUNT).astype(int)
+    preprocessor = _preprocessor(SyntheticSidescanFile(altitudes))
+
+    preprocessor.detect_bottom_line(blanking_m=0.0, smoothing=1.0)
+
+    error = preprocessor.starboard_bottom_dist - altitudes
+    assert np.percentile(np.abs(error), 90) <= 6
+
+
+def test_smoothing_reduces_jitter_monotonically():
+    """The control has to have a visible, ordered effect -- it previously did not."""
+
+    generator = np.random.default_rng(3)
+    altitudes = 100 + generator.integers(-4, 5, PING_COUNT)
+    preprocessor = _preprocessor(SyntheticSidescanFile(altitudes, noise=6.0))
+
+    jitter = []
+    for smoothing in (0.0, 0.05, 0.2, 1.0):
+        preprocessor.detect_bottom_line(blanking_m=0.0, smoothing=smoothing)
+        line = preprocessor.starboard_bottom_dist
+        jitter.append(float(np.mean(np.abs(np.diff(line)))))
+
+    assert jitter == sorted(jitter, reverse=True)
+    assert jitter[-1] < jitter[0] / 3

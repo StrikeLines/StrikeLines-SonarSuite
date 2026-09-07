@@ -3090,12 +3090,15 @@ class QtContactPickerWindow(QMainWindow):
         blanking_row.addWidget(self.bottom_blanking_spin)
         form.addRow("Blanking", blanking_row)
 
+        # At a weight of 1 one sample of movement costs the whole data-cost
+        # range, which is the point past which the line stops following real
+        # depth change, so that is the top of the slider.
         self.bottom_smoothing_slider, self.bottom_smoothing_spin = self._fine_control(
             0.0,
-            50.0,
-            4.0,
-            step=0.5,
-            decimals=1,
+            1.0,
+            0.10,
+            step=0.01,
+            decimals=2,
             suffix="",
         )
         self.bottom_smoothing_spin.setToolTip(

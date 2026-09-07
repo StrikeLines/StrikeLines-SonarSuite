@@ -10,12 +10,6 @@ import geopy.distance as geo_dist
 from sidescantools.aux_functions import convert_to_dB, hist_equalization
 
 
-# Number of bottom candidates kept per ping before the path search. Enough to
-# offer the search real alternatives, small enough that the transition matrix
-# stays trivial.
-BOTTOM_CANDIDATES_PER_PING = 32
-
-
 def bottom_step_scores(channel, window=None):
     """Score every sample by how much it looks like the bottom's leading edge.
 
@@ -65,100 +59,92 @@ def bottom_step_scores(channel, window=None):
     return step
 
 
-def bottom_candidates(scores, blank_samples, count=BOTTOM_CANDIDATES_PER_PING):
-    """Reduce each ping's scores to its best few local maxima.
+def bottom_sample_costs(scores, blank_samples, blocked_cost=10.0):
+    """Turn scores into a per-sample cost: 0 for a ping's best sample, 1 for its worst.
 
-    Returns ``(indices, costs)`` shaped ``[ping, count]``. Costs are scaled to
-    ``[0, 1]`` per ping, where 0 is that ping's strongest candidate, so the
-    smoothing weight means the same thing on every file.
+    Every sample keeps a cost, rather than only the score's local maxima. A
+    smooth line has to be able to pass through samples that are not peaks in
+    their own ping, so restricting the search to peaks puts a floor on how
+    smooth a result can be no matter how heavily smoothing is weighted.
+
+    Samples inside the blanked span, or too close to an end of the ping to
+    carry a score, get ``blocked_cost`` so the search avoids them without ever
+    being left with nowhere to go.
     """
 
     scores = np.asarray(scores, dtype=float)
     ping_count, ping_len = scores.shape
-    count = int(np.clip(count, 1, ping_len))
+    finite = np.isfinite(scores)
+
+    high = np.max(np.where(finite, scores, -np.inf), axis=1, keepdims=True)
+    low = np.min(np.where(finite, scores, np.inf), axis=1, keepdims=True)
+    high = np.where(np.isfinite(high), high, 0.0)
+    low = np.where(np.isfinite(low), low, 0.0)
+    span = np.maximum(high - low, 1e-9)
+    cost = (high - np.where(finite, scores, low)) / span
 
     blank = np.asarray(blank_samples, dtype=int)
     if blank.ndim == 0:
         blank = np.full(ping_count, int(blank))
-    # Always leave the search somewhere legal to put the line.
-    blank = np.clip(blank, 0, ping_len - 1)
-    allowed = np.arange(ping_len)[None, :] >= blank[:, None]
-
-    interior = np.zeros_like(scores, dtype=bool)
-    if ping_len >= 3:
-        interior[:, 1:-1] = (scores[:, 1:-1] >= scores[:, :-2]) & (
-            scores[:, 1:-1] >= scores[:, 2:]
-        )
-    interior[:, 0] = True
-    interior[:, -1] = True
-
-    scorable = allowed & np.isfinite(scores)
-    usable = interior & scorable
-    # A ping with no local maximum in the allowed span still has to contribute
-    # something, so fall back to every scorable sample there.
-    usable[~usable.any(axis=1)] = True
-    usable &= scorable
-    # And if blanking left nothing scorable at all, allow the whole ping.
-    usable[~usable.any(axis=1)] = True
-
-    ranked = np.where(usable, scores, -np.inf)
-    take = min(count, ping_len)
-    top = np.argpartition(-ranked, take - 1, axis=1)[:, :take]
-    top_scores = np.take_along_axis(ranked, top, axis=1)
-    order = np.argsort(-top_scores, axis=1)
-    indices = np.take_along_axis(top, order, axis=1)
-    chosen = np.take_along_axis(top_scores, order, axis=1)
-
-    # Repeat the best candidate when a ping offered fewer than `count`.
-    chosen = np.where(np.isfinite(chosen), chosen, -np.inf)
-    best = chosen[:, :1]
-    indices = np.where(np.isfinite(chosen), indices, indices[:, :1])
-    chosen = np.where(np.isfinite(chosen), chosen, best)
-
-    spread = np.maximum(best - chosen.min(axis=1, keepdims=True), 1e-9)
-    costs = (best - chosen) / spread
-    return indices.astype(np.int64), costs
+    allowed = finite & (np.arange(ping_len)[None, :] >= blank[:, None])
+    return np.where(allowed, cost, float(blocked_cost))
 
 
-def bottom_dp_path(indices, costs, smoothing_weight):
-    """Pick the lowest-cost path of candidates through the whole file.
+def _running_min_with_argmin(values):
+    """Running minimum of ``values`` and the index each minimum came from."""
 
-    Each ping pays its candidate's data cost plus ``smoothing_weight`` times
-    the distance moved from the previous ping, expressed as a fraction of the
-    ping width. Because the whole path is optimized at once the result does
-    not depend on which end the search starts from, and no ping can be left
-    without an answer.
+    index = np.arange(values.shape[0])
+    running = np.minimum.accumulate(values)
+    # A sample can only equal the running minimum where it sets a new one.
+    return running, np.maximum.accumulate(np.where(values <= running, index, -1))
+
+
+def bottom_dp_path(costs, smoothing_weight):
+    """Choose the lowest-cost bottom line through the whole file.
+
+    Each ping pays its sample's data cost plus ``smoothing_weight`` for every
+    sample of movement away from the previous ping. Optimizing the whole path
+    at once means the answer does not depend on which end the search starts
+    from, and no ping can be left without one.
+
+    The movement term is a one-dimensional min-convolution with an absolute
+    value, so it is evaluated with a forward and a backward running minimum
+    rather than by comparing every pair of samples. That keeps the search
+    linear in the samples per ping instead of quadratic, and it is exact --
+    ``tests/test_bottom_detection.py`` checks it against an exhaustive search.
     """
 
-    indices = np.asarray(indices)
     costs = np.asarray(costs, dtype=float)
-    ping_count, count = indices.shape
+    ping_count, ping_len = costs.shape
     if ping_count == 0:
         return np.zeros(0, dtype=np.int64), np.zeros(0)
 
-    scale = float(max(1, indices.max(initial=1)))
     weight = float(smoothing_weight)
+    index = np.arange(ping_len)
     total = costs[0].copy()
-    back = np.zeros((ping_count, count), dtype=np.int32)
+    back = np.zeros((ping_count, ping_len), dtype=np.int32)
+
     for ping in range(1, ping_count):
-        movement = np.abs(
-            indices[ping][None, :].astype(float) - indices[ping - 1][:, None]
-        )
-        combined = total[:, None] + weight * movement / scale
-        previous = np.argmin(combined, axis=0)
-        total = combined[previous, np.arange(count)] + costs[ping]
-        back[ping] = previous
+        forward, forward_arg = _running_min_with_argmin(total - weight * index)
+        forward = forward + weight * index
+
+        reverse = (total + weight * index)[::-1]
+        backward, backward_arg = _running_min_with_argmin(reverse)
+        backward = backward[::-1] - weight * index
+        backward_arg = (ping_len - 1 - backward_arg)[::-1]
+
+        take_forward = forward <= backward
+        total = np.where(take_forward, forward, backward) + costs[ping]
+        back[ping] = np.where(take_forward, forward_arg, backward_arg)
 
     path = np.zeros(ping_count, dtype=np.int64)
     data_cost = np.zeros(ping_count)
     chosen = int(np.argmin(total))
     for ping in range(ping_count - 1, -1, -1):
-        path[ping] = indices[ping, chosen]
+        path[ping] = chosen
         data_cost[ping] = costs[ping, chosen]
         chosen = int(back[ping, chosen])
     return path, data_cost
-
-
 
 def resolve_downsampling_factor(
     sidescan_file,
@@ -342,19 +328,17 @@ class SidescanPreprocessor:
     def detect_bottom_line(
         self,
         blanking_m=0.0,
-        smoothing=2.0,
+        smoothing=0.10,
         bottom_strategy_choice="",
-        candidates_per_ping=BOTTOM_CANDIDATES_PER_PING,
     ):
         """Detect the bottom line by searching for the best path through the file.
 
         Every ping is scored independently (see :func:`bottom_step_scores`),
-        reduced to a few candidates, and then one line is chosen for the whole
-        file that balances those scores against how far it moves between
-        pings. Unlike the threshold detector this cannot collapse onto a
-        constant: the path is always drawn from real candidates, and each
-        ping's data cost records whether it was chosen on evidence or on
-        continuity.
+        and then one line is chosen for the whole file that balances those
+        scores against how far it moves between pings. Unlike the threshold
+        detector this cannot collapse onto a constant: every ping's value
+        comes from that ping's own data, and its recorded data cost says
+        whether it was chosen on evidence or on continuity.
 
         Parameters
         ----------
@@ -363,8 +347,9 @@ class SidescanPreprocessor:
             samples per ping, so it stays a fixed distance even where the
             recorded range changes mid-file.
         smoothing: float
-            How strongly the line resists moving between neighbouring pings.
-            0 lets every ping follow its own best candidate.
+            Cost charged per sample of movement between neighbouring pings,
+            relative to a data cost that spans 0 to 1 within each ping. 0 lets
+            every ping follow its own strongest return.
         bottom_strategy_choice: str
             One of :attr:`bottom_strategy_choices`. Selects whether the two
             channels are detected separately, pooled, or one mirrored onto the
@@ -400,26 +385,26 @@ class SidescanPreprocessor:
             # a clean side carry a noisy one.
             pooled = port_scores + starboard_scores
             nadir_dist, cost = self._bottom_path(
-                pooled, blank_samples, smoothing, candidates_per_ping
+                pooled, blank_samples, smoothing
             )
             port_nadir, starboard_nadir = nadir_dist, nadir_dist
             port_cost = starboard_cost = cost
         elif bottom_strategy_choice == choices[2]:
             port_nadir, port_cost = self._bottom_path(
-                port_scores, blank_samples, smoothing, candidates_per_ping
+                port_scores, blank_samples, smoothing
             )
             starboard_nadir, starboard_cost = port_nadir, port_cost
         elif bottom_strategy_choice == choices[3]:
             starboard_nadir, starboard_cost = self._bottom_path(
-                starboard_scores, blank_samples, smoothing, candidates_per_ping
+                starboard_scores, blank_samples, smoothing
             )
             port_nadir, port_cost = starboard_nadir, starboard_cost
         else:
             port_nadir, port_cost = self._bottom_path(
-                port_scores, blank_samples, smoothing, candidates_per_ping
+                port_scores, blank_samples, smoothing
             )
             starboard_nadir, starboard_cost = self._bottom_path(
-                starboard_scores, blank_samples, smoothing, candidates_per_ping
+                starboard_scores, blank_samples, smoothing
             )
 
         # Back to the stored convention: port counts from the outer range,
@@ -433,11 +418,9 @@ class SidescanPreprocessor:
         self.bottom_line_data_cost = np.vstack((port_cost, starboard_cost))
         return self.bottom_line_data_cost
 
-    def _bottom_path(self, scores, blank_samples, smoothing, candidates_per_ping):
-        indices, costs = bottom_candidates(
-            scores, blank_samples, count=candidates_per_ping
-        )
-        return bottom_dp_path(indices, costs, smoothing)
+    def _bottom_path(self, scores, blank_samples, smoothing):
+        costs = bottom_sample_costs(scores, blank_samples)
+        return bottom_dp_path(costs, smoothing)
 
     def detect_bottom_line_t(
         self,
