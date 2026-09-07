@@ -11,6 +11,7 @@ from sidescantools.readers.base import (
     UnsupportedSonarFormatError,
 )
 from sidescantools.readers.jsf import JSFReader, jsf_tow_data
+from sidescantools.readers.lowrance import LowranceReader
 from sidescantools.readers.rsd import RSDReader
 from sidescantools.readers.xtf import XTFReader, xtf_tow_data
 
@@ -19,6 +20,7 @@ sonar_reader_registry = SonarReaderRegistry()
 sonar_reader_registry.register(JSFReader())
 sonar_reader_registry.register(XTFReader())
 sonar_reader_registry.register(RSDReader())
+sonar_reader_registry.register(LowranceReader())
 
 
 def register_sonar_reader(reader: SonarReader, *, replace: bool = False) -> None:
@@ -56,6 +58,7 @@ def sonar_file_dialog_filter() -> str:
 
 __all__ = [
     "JSFReader",
+    "LowranceReader",
     "RSDReader",
     "SonarDataset",
     "SonarReader",

@@ -39,7 +39,7 @@ required runtime files.
 Before publishing, test the copied bundle on a clean Windows computer:
 
 1. Launch without command-line arguments and confirm the idle workspace opens.
-2. Open representative JSF, XTF, and Garmin RSD files.
+2. Open representative JSF, XTF, Garmin RSD, and Lowrance SL2/SL3 files.
 3. Create and edit a contact database.
 4. Export EPSG:4326 and EPSG:3857 GeoTIFFs.
 5. Restart the application and confirm per-file CFG settings are restored.

@@ -5,6 +5,7 @@ import pytest
 
 from sidescantools.readers import (
     JSFReader,
+    LowranceReader,
     RSDReader,
     SonarDataset,
     SonarReaderRegistry,
@@ -67,7 +68,15 @@ def test_builtin_readers_are_registered_as_independent_adapters():
     assert isinstance(sonar_reader_registry.reader_for("line.JSF"), JSFReader)
     assert isinstance(sonar_reader_registry.reader_for("line.xtf"), XTFReader)
     assert isinstance(sonar_reader_registry.reader_for("line.RSD"), RSDReader)
-    assert supported_sonar_suffixes() == (".jsf", ".xtf", ".rsd")
+    assert isinstance(sonar_reader_registry.reader_for("line.SL2"), LowranceReader)
+    assert supported_sonar_suffixes() == (
+        ".jsf",
+        ".xtf",
+        ".rsd",
+        ".slg",
+        ".sl2",
+        ".sl3",
+    )
 
 
 def test_registry_dispatches_case_insensitively_and_normalizes_suffixes(tmp_path):

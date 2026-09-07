@@ -11,6 +11,10 @@ sidescantools-smoke-error.txt
 # Local sonar surveys and generated processing/project data
 *.jsf
 *.xtf
+*.rsd
+*.slg
+*.sl2
+*.sl3
 *_bottom_info.npz
 *.tvg_gain.cfg
 egn_table_*.npz
