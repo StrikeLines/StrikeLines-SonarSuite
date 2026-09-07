@@ -3062,18 +3062,51 @@ class QtContactPickerWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         form = QFormLayout()
 
-        self.bottom_threshold_slider, self.bottom_threshold_spin = self._fine_control(
+        # Blanking is only ever useful over a fraction of the swath, and the
+        # bound is cosmetic, so fall back quietly if the range is unusable.
+        slant_range = np.asarray(
+            getattr(self.sidescan_file, "slant_range", []), dtype=float
+        )
+        max_range_m = (
+            float(np.nanmax(slant_range))
+            if slant_range.size and np.isfinite(slant_range).any()
+            else 100.0
+        )
+        self.bottom_blanking_slider, self.bottom_blanking_spin = self._fine_control(
             0.0,
-            1.0,
-            self.loader_settings.default_threshold,
-            step=0.01,
-            decimals=2,
+            max(1.0, round(max_range_m / 2.0, 1)),
+            0.0,
+            step=0.1,
+            decimals=1,
+            suffix=" m",
+        )
+        self.bottom_blanking_spin.setToolTip(
+            "Ignore returns closer to the sonar than this. Raise it to skip "
+            "noise high in the water column -- ringdown, aeration, prop wash. "
+            "Set above the true depth and the line cannot find the bottom."
+        )
+        blanking_row = QHBoxLayout()
+        blanking_row.addWidget(self.bottom_blanking_slider, 1)
+        blanking_row.addWidget(self.bottom_blanking_spin)
+        form.addRow("Blanking", blanking_row)
+
+        self.bottom_smoothing_slider, self.bottom_smoothing_spin = self._fine_control(
+            0.0,
+            50.0,
+            4.0,
+            step=0.5,
+            decimals=1,
             suffix="",
         )
-        threshold_row = QHBoxLayout()
-        threshold_row.addWidget(self.bottom_threshold_slider, 1)
-        threshold_row.addWidget(self.bottom_threshold_spin)
-        form.addRow("Threshold", threshold_row)
+        self.bottom_smoothing_spin.setToolTip(
+            "How strongly the bottom line resists jumping between "
+            "neighbouring pings. Raise it to ride over fish, wakes and other "
+            "false targets; lower it to follow genuinely rough ground."
+        )
+        smoothing_row = QHBoxLayout()
+        smoothing_row.addWidget(self.bottom_smoothing_slider, 1)
+        smoothing_row.addWidget(self.bottom_smoothing_spin)
+        form.addRow("Smoothing", smoothing_row)
 
         self.bottom_strategy_combo = QComboBox()
         self.bottom_strategy_combo.addItems(self.preprocessor.bottom_strategy_choices)
@@ -3083,14 +3116,17 @@ class QtContactPickerWindow(QMainWindow):
         form.addRow("Strategy", self.bottom_strategy_combo)
         layout.addLayout(form)
 
-        # Threshold and strategy describe one file-level bottom track. Apply
-        # them to the whole file after the controls settle, rather than
-        # allowing different chunks to retain different detector settings.
+        # Blanking, smoothing and strategy describe one file-level bottom
+        # track. Apply them to the whole file after the controls settle,
+        # rather than letting chunks keep different detector settings.
         self.bottom_recalc_timer = QTimer(self)
         self.bottom_recalc_timer.setSingleShot(True)
         self.bottom_recalc_timer.setInterval(400)
         self.bottom_recalc_timer.timeout.connect(self.recalc_bottom_whole_file)
-        self.bottom_threshold_spin.valueChanged.connect(
+        self.bottom_blanking_spin.valueChanged.connect(
+            lambda _value: self.bottom_recalc_timer.start()
+        )
+        self.bottom_smoothing_spin.valueChanged.connect(
             lambda _value: self.bottom_recalc_timer.start()
         )
         self.bottom_strategy_combo.currentIndexChanged.connect(
@@ -3100,9 +3136,9 @@ class QtContactPickerWindow(QMainWindow):
         recalc_row = QHBoxLayout()
         self.recalc_all_button = QPushButton("Recalculate Whole File…")
         self.recalc_all_button.setToolTip(
-            "Explicitly rerun the current threshold and strategy across the "
-            "entire file. Changes to either control already do this "
-            "automatically after a short pause."
+            "Explicitly rerun the current bottom settings across the entire "
+            "file. Changing any of them already does this automatically "
+            "after a short pause."
         )
         self.recalc_all_button.clicked.connect(self.recalc_bottom_whole_file)
         recalc_row.addWidget(self.recalc_all_button)
@@ -3235,22 +3271,52 @@ class QtContactPickerWindow(QMainWindow):
         if self.bottom_worker is not None:
             self._pending_full_bottom_recalc = True
             self.bottom_status_label.setText(
-                "Current calculation finishing; latest threshold queued…"
+                "Current calculation finishing; latest settings queued…"
             )
             return
         self._pending_full_bottom_recalc = False
-        threshold = self.bottom_threshold_spin.value()
-        combine_both_sides = (
-            self.bottom_strategy_combo.currentText()
-            == self.preprocessor.bottom_strategy_choices[1]
-        )
+        blanking_m = self.bottom_blanking_spin.value()
+        smoothing = self.bottom_smoothing_spin.value()
+        strategy = self.bottom_strategy_combo.currentText()
+        self._last_blanking_m = blanking_m
 
         def run_algorithm(processor: SidescanPreprocessor) -> None:
-            processor.detect_bottom_line_t(
-                threshold_bin=threshold, combine_both_sides=combine_both_sides
+            processor.detect_bottom_line(
+                blanking_m=blanking_m,
+                smoothing=smoothing,
+                bottom_strategy_choice=strategy,
             )
 
         self._start_bottom_worker(run_algorithm, "Recalculating bottom line…")
+
+    def _blanking_warning(self) -> str:
+        """Warn when blanking is holding the line off the seafloor.
+
+        Blanking is a floor on detectable depth, so setting it deeper than the
+        water silently pins the line to that floor and it still looks like a
+        confident track.
+        """
+
+        blanking_m = getattr(self, "_last_blanking_m", 0.0)
+        if blanking_m <= 0:
+            return ""
+        preproc = self.preprocessor
+        slant_range = np.asarray(preproc.sidescan_file.slant_range, dtype=float)
+        starboard = np.asarray(preproc.starboard_bottom_dist, dtype=float)
+        if starboard.size == 0:
+            return ""
+        meters_per_sample = float(np.nanmedian(slant_range[0])) / preproc.ping_len
+        if not np.isfinite(meters_per_sample) or meters_per_sample <= 0:
+            return ""
+        blank_samples = blanking_m / meters_per_sample
+        pinned = float(np.mean(starboard <= blank_samples + 1))
+        if pinned < 0.05:
+            return ""
+        return (
+            f" Warning: {pinned:.0%} of pings sit at the blanking limit -- the "
+            f"water is likely shallower than {blanking_m:.1f} m here. Lower "
+            "Blanking."
+        )
 
     def refine_bottom_with_altitude(self) -> None:
         search_range = self.bottom_search_range_spin.value()
@@ -3306,7 +3372,7 @@ class QtContactPickerWindow(QMainWindow):
         self.preprocessor.bottom_map = processor_copy.bottom_map
         self._refresh_bottom_overlay()
         self._set_bottom_controls_enabled(True)
-        self.bottom_status_label.setText("Bottom line updated")
+        self.bottom_status_label.setText("Bottom line updated" + self._blanking_warning())
         self._mark_bottom_line_dirty()
 
     def _bottom_recalc_failed(self, message: str) -> None:

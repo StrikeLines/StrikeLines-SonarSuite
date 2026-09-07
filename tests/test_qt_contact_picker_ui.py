@@ -299,7 +299,7 @@ def test_processing_panel_starts_with_gain_and_view_controls(qtbot, tmp_path):
         assert removed_text not in visible_text
 
 
-def test_bottom_threshold_recalculates_the_whole_file_after_debounce(qtbot):
+def test_bottom_controls_recalculate_the_whole_file_after_debounce(qtbot):
     window = QMainWindow()
     qtbot.addWidget(window)
     recalculations = []
@@ -330,10 +330,13 @@ def test_bottom_threshold_recalculates_the_whole_file_after_debounce(qtbot):
     assert "Recalculate Whole File…" in button_text
     assert window.bottom_recalc_timer.interval() == 400
 
-    window.bottom_threshold_spin.setValue(0.71)
+    window.bottom_blanking_spin.setValue(1.5)
     qtbot.waitUntil(lambda: len(recalculations) == 1, timeout=1500)
-
     assert recalculations == [True]
+
+    window.bottom_smoothing_spin.setValue(9.0)
+    qtbot.waitUntil(lambda: len(recalculations) == 2, timeout=1500)
+    assert recalculations == [True, True]
 
 
 def test_running_bottom_calculation_discards_stale_result_and_runs_latest(qtbot):
