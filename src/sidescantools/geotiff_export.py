@@ -364,6 +364,7 @@ def prepare_sonar_export(
     active_hist_equal: bool,
     geometry_settings: GeometrySettings,
     progress: Callable[[int, str], None] | None = None,
+    target_samples_per_channel: int | None = None,
 ) -> PreparedSonarExport:
     """Load one file and reproduce its persisted waterfall for batch export."""
 
@@ -383,7 +384,9 @@ def prepare_sonar_export(
         manual_layback_m=settings.layback_override_m,
     )
     downsampling_factor = resolve_downsampling_factor(
-        sidescan_file, downsampling_factor
+        sidescan_file,
+        downsampling_factor,
+        target_samples_per_channel,
     )
     preprocessor = SidescanPreprocessor(
         sidescan_file=sidescan_file,
@@ -480,6 +483,7 @@ def export_sonar_file(
     geometry_settings: GeometrySettings,
     overwrite: bool = False,
     progress: Callable[[int, str], None] | None = None,
+    target_samples_per_channel: int | None = None,
 ) -> GeoTiffExportResult:
     prepared = prepare_sonar_export(
         sonar_path,
@@ -490,6 +494,7 @@ def export_sonar_file(
         active_hist_equal=active_hist_equal,
         geometry_settings=geometry_settings,
         progress=progress,
+        target_samples_per_channel=target_samples_per_channel,
     )
     result = export_prepared_waterfall(
         sonar_path,

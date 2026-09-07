@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 import numpy as np
-from qtpy.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
+from qtpy.QtCore import QObject, QRunnable, QSettings, Qt, QThreadPool, QTimer, Signal
 from qtpy.QtGui import (
     QBrush,
     QColor,
@@ -26,6 +26,8 @@ from qtpy.QtGui import (
 )
 from qtpy.QtWidgets import (
     QAbstractSpinBox,
+    QAction,
+    QActionGroup,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -101,6 +103,97 @@ from sidescantools.sidescan_preproc import (
     resolve_downsampling_factor,
 )
 from sidescantools.swath_geometry import GeometrySettings
+
+
+WATERFALL_TARGET_PREFERENCE_KEY = "processing/waterfall_target_samples_per_side"
+WATERFALL_TARGET_CHOICES = (
+    (None, "Automatic (legacy factor)"),
+    (256, "Fast (256 samples per side)"),
+    (512, "Standard (512 samples per side)"),
+    (1024, "High (1,024 samples per side)"),
+    (2048, "Very high (2,048 samples per side)"),
+    (0, "Native resolution (most memory)"),
+)
+_VALID_WATERFALL_TARGETS = {target for target, _label in WATERFALL_TARGET_CHOICES}
+
+
+def sonar_suite_settings() -> QSettings:
+    """Return the application-wide settings store used by the Qt workspace."""
+
+    return QSettings("StrikeLines", "SonarSuite")
+
+
+def load_waterfall_target_samples(settings: QSettings | None = None) -> int | None:
+    """Load the system-wide target resolution; ``None`` means automatic."""
+
+    settings = settings or sonar_suite_settings()
+    value = settings.value(WATERFALL_TARGET_PREFERENCE_KEY, None)
+    if value is None or str(value).strip().lower() == "automatic":
+        return None
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value in _VALID_WATERFALL_TARGETS else None
+
+
+def save_waterfall_target_samples(
+    target_samples_per_channel: int | None,
+    settings: QSettings | None = None,
+) -> None:
+    """Persist the system-wide waterfall resolution preference."""
+
+    if target_samples_per_channel not in _VALID_WATERFALL_TARGETS:
+        raise ValueError("unsupported waterfall target resolution")
+    settings = settings or sonar_suite_settings()
+    stored_value = (
+        "automatic"
+        if target_samples_per_channel is None
+        else int(target_samples_per_channel)
+    )
+    settings.setValue(WATERFALL_TARGET_PREFERENCE_KEY, stored_value)
+    settings.sync()
+
+
+def _install_options_menu(
+    window: QMainWindow,
+    *,
+    selected_target: int | None,
+    on_target_changed: Callable[[int | None], None],
+    resolution_summary: str | None = None,
+) -> None:
+    """Install the shared Options > Waterfall target resolution menu."""
+
+    options_menu = window.menuBar().addMenu("&Options")
+    resolution_menu = options_menu.addMenu("Waterfall target resolution")
+    action_group = QActionGroup(window)
+    action_group.setExclusive(True)
+    actions: dict[int | None, QAction] = {}
+    for target, label in WATERFALL_TARGET_CHOICES:
+        action = QAction(label, window)
+        action.setCheckable(True)
+        action.setChecked(target == selected_target)
+        action.setStatusTip(
+            "Choose the approximate across-track samples retained for each sonar side"
+        )
+        action.triggered.connect(
+            lambda checked=False, selected=target: (
+                on_target_changed(selected) if checked else None
+            )
+        )
+        action_group.addAction(action)
+        resolution_menu.addAction(action)
+        actions[target] = action
+    resolution_menu.addSeparator()
+    info_action = QAction(
+        resolution_summary or "The selected target is applied when a file opens.", window
+    )
+    info_action.setEnabled(False)
+    resolution_menu.addAction(info_action)
+    # Keep Python references for bindings that do not retain wrapper objects.
+    window.waterfall_resolution_action_group = action_group
+    window.waterfall_resolution_actions = actions
+    window.waterfall_resolution_info_action = info_action
 
 
 class GainProcessingSignals(QObject):
@@ -192,6 +285,13 @@ class GeoTiffExportWorker(QRunnable):
                         ),
                         downsampling_factor=(
                             self.loader_settings.downsampling_factor
+                        ),
+                        target_samples_per_channel=(
+                            getattr(
+                                self.loader_settings,
+                                "target_samples_per_channel",
+                                None,
+                            )
                         ),
                         active_db=self.loader_settings.active_dB,
                         active_hist_equal=(
@@ -691,6 +791,9 @@ class SonarLoaderSettings:
     active_hist_equal: bool
     output_directory: Path
     geometry_settings: GeometrySettings
+    # None preserves the legacy fixed factor; zero requests native resolution.
+    # Positive values are approximate samples retained per side.
+    target_samples_per_channel: int | None = None
 
 
 @dataclass
@@ -768,7 +871,9 @@ def _load_sonar_context(
         manual_layback_m=layback_override_m,
     )
     downsampling_factor = resolve_downsampling_factor(
-        sidescan_file, settings.downsampling_factor
+        sidescan_file,
+        settings.downsampling_factor,
+        settings.target_samples_per_channel,
     )
     preprocessor = SidescanPreprocessor(
         sidescan_file=sidescan_file,
@@ -1580,6 +1685,12 @@ class QtContactPickerWindow(QMainWindow):
         self.interaction_modes.add_listener(self._apply_interaction_mode)
         self.setWindowTitle("SidescanTools - Contact picker (Qt raster)")
         self.resize(1400, 820)
+        _install_options_menu(
+            self,
+            selected_target=self.loader_settings.target_samples_per_channel,
+            on_target_changed=self._set_waterfall_target_samples,
+            resolution_summary=self._waterfall_resolution_summary(),
+        )
 
         self.view = WaterfallView()
         self.view.pixel_clicked.connect(self.pick_contact)
@@ -1784,6 +1895,54 @@ class QtContactPickerWindow(QMainWindow):
         self._update_status()
         if gain_settings_notice:
             self.statusBar().showMessage(gain_settings_notice, 8000)
+
+    def _waterfall_resolution_summary(self) -> str:
+        native = int(self.sidescan_file.ping_len)
+        processed = int(self.preprocessor.ping_len)
+        factor = int(self.preprocessor.downsampling_factor)
+        return (
+            f"Current file: {native:,} → {processed:,} samples per side "
+            f"(factor {factor})"
+        )
+
+    def _sync_waterfall_resolution_menu(self) -> None:
+        selected = self.loader_settings.target_samples_per_channel
+        for target, action in self.waterfall_resolution_actions.items():
+            action.setChecked(target == selected)
+        self.waterfall_resolution_info_action.setText(
+            self._waterfall_resolution_summary()
+        )
+
+    def _set_waterfall_target_samples(
+        self, target_samples_per_channel: int | None
+    ) -> None:
+        if target_samples_per_channel == self.loader_settings.target_samples_per_channel:
+            return
+        if any(
+            worker is not None
+            for worker in (
+                self.processing_worker,
+                self.bottom_worker,
+                self.geotiff_worker,
+            )
+        ):
+            QMessageBox.information(
+                self,
+                "Processing in progress",
+                "Wait for the current processing or export operation to finish "
+                "before changing waterfall resolution.",
+            )
+            self._sync_waterfall_resolution_menu()
+            return
+
+        save_waterfall_target_samples(target_samples_per_channel)
+        self.loader_settings.target_samples_per_channel = target_samples_per_channel
+        self.statusBar().showMessage(
+            "Reloading the current file at the selected waterfall resolution…"
+        )
+        QApplication.processEvents()
+        self.load_file(self.filepath)
+        self._sync_waterfall_resolution_menu()
 
     @staticmethod
     def _gain_control(minimum: int, maximum: int, value: float):
@@ -2135,6 +2294,7 @@ class QtContactPickerWindow(QMainWindow):
         self.refresh_chunk()
         self._refresh_bottom_overlay()
         self._update_file_position()
+        self._sync_waterfall_resolution_menu()
         self._update_status(f"Opened {filepath.name}")
         if gain_settings_notice:
             self.statusBar().showMessage(gain_settings_notice, 8000)
@@ -3383,6 +3543,7 @@ class QtContactPickerStartWindow(QMainWindow):
         open_selected_file: Callable[[Path], QtContactPickerWindow],
         *,
         initial_directory: Path | None = None,
+        waterfall_target_samples: int | None = None,
     ):
         super().__init__()
         self._open_selected_file = open_selected_file
@@ -3390,6 +3551,12 @@ class QtContactPickerStartWindow(QMainWindow):
         self._loaded_window: QtContactPickerWindow | None = None
         self.setWindowTitle("SidescanTools - Contact picker (Qt raster)")
         self.resize(1400, 820)
+        self.waterfall_target_samples = waterfall_target_samples
+        _install_options_menu(
+            self,
+            selected_target=self.waterfall_target_samples,
+            on_target_changed=self._set_waterfall_target_samples,
+        )
 
         self.open_button = QPushButton("Open…")
         self.open_button.setToolTip("Open a sonar file")
@@ -3441,6 +3608,16 @@ class QtContactPickerStartWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, contacts_dock)
         self.statusBar().showMessage("Ready — select Open… to choose a sonar file")
 
+    def _set_waterfall_target_samples(
+        self, target_samples_per_channel: int | None
+    ) -> None:
+        save_waterfall_target_samples(target_samples_per_channel)
+        self.waterfall_target_samples = target_samples_per_channel
+        self.statusBar().showMessage(
+            "Waterfall target resolution saved; it will apply when a file opens.",
+            5000,
+        )
+
     def open_file(self) -> None:
         start_dir = str(self._initial_directory or "")
         filename, _ = QFileDialog.getOpenFileName(
@@ -3483,6 +3660,7 @@ def run_qt_contact_picker(
     active_hist_equal: bool = False,
     contacts_db_path: str | os.PathLike | None = None,
     geometry_settings: GeometrySettings | None = None,
+    target_samples_per_channel: int | None = None,
     block: bool = True,
 ):
     """Open the no-OpenGL contact picker using Qt's raster paint engine.
@@ -3491,6 +3669,8 @@ def run_qt_contact_picker(
     workspace. The user can then choose a file with the normal Open button.
     """
     application = QApplication.instance() or QApplication([])
+    if target_samples_per_channel is None:
+        target_samples_per_channel = load_waterfall_target_samples()
     icon_path = Path(__file__).resolve().parent / "res" / "icon.ico"
     if icon_path.is_file():
         application.setWindowIcon(QIcon(str(icon_path)))
@@ -3515,6 +3695,7 @@ def run_qt_contact_picker(
         window = QtContactPickerStartWindow(
             open_selected_file,
             initial_directory=initial_directory,
+            waterfall_target_samples=target_samples_per_channel,
         )
         window.show()
         if block:
@@ -3537,6 +3718,7 @@ def run_qt_contact_picker(
         active_hist_equal=active_hist_equal,
         output_directory=output_directory,
         geometry_settings=geometry_settings or GeometrySettings(vertical_beam_angle=60),
+        target_samples_per_channel=target_samples_per_channel,
     )
 
     store = ContactStore(database)

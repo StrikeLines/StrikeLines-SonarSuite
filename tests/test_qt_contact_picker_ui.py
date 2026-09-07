@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from qtpy.QtCore import QEvent, QObject, QPoint, QRunnable, Qt, QTimer, Signal
+from qtpy.QtCore import QEvent, QObject, QPoint, QRunnable, QSettings, Qt, QTimer, Signal
 from qtpy.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -39,8 +39,10 @@ from sidescantools.qt_contact_picker_ui import (
     SonarLoaderSettings,
     WaterfallGainModel,
     WaterfallView,
+    load_waterfall_target_samples,
     logical_bottom_overlay,
     logical_waterfall,
+    save_waterfall_target_samples,
     sonar_files_in_directory,
     waterfall_rgb,
     run_qt_contact_picker,
@@ -102,6 +104,39 @@ def test_idle_workspace_opens_selected_file_through_open_button(
 
     assert opened == [sonar_path]
     assert window._loaded_window is loaded_window
+
+
+def test_waterfall_target_resolution_preference_round_trip(tmp_path):
+    settings = QSettings(str(tmp_path / "preferences.ini"), QSettings.IniFormat)
+
+    assert load_waterfall_target_samples(settings) is None
+    save_waterfall_target_samples(1024, settings)
+    assert load_waterfall_target_samples(settings) == 1024
+    save_waterfall_target_samples(0, settings)
+    assert load_waterfall_target_samples(settings) == 0
+    save_waterfall_target_samples(None, settings)
+    assert load_waterfall_target_samples(settings) is None
+
+
+def test_idle_options_menu_updates_target_resolution(qtbot, monkeypatch):
+    saved = []
+    monkeypatch.setattr(
+        qt_contact_picker_ui,
+        "save_waterfall_target_samples",
+        lambda target: saved.append(target),
+    )
+    window = QtContactPickerStartWindow(
+        lambda _path: None,
+        waterfall_target_samples=512,
+    )
+    qtbot.addWidget(window)
+
+    assert window.waterfall_resolution_actions[512].isChecked()
+    window.waterfall_resolution_actions[1024].trigger()
+
+    assert saved == [1024]
+    assert window.waterfall_target_samples == 1024
+    assert window.waterfall_resolution_actions[1024].isChecked()
 
 
 def test_logical_waterfall_stitches_chunks_and_removes_padding():

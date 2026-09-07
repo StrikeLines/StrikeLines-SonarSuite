@@ -407,7 +407,14 @@ def test_batch_worker_exports_every_file_with_its_own_loader_path(monkeypatch, t
     calls = []
 
     def fake_export(source, **kwargs):
-        calls.append((Path(source), kwargs["epsg"], kwargs["downsampling_factor"]))
+        calls.append(
+            (
+                Path(source),
+                kwargs["epsg"],
+                kwargs["downsampling_factor"],
+                kwargs["target_samples_per_channel"],
+            )
+        )
         return SimpleNamespace(used_default_settings=False)
 
     monkeypatch.setattr(qt_contact_picker_ui, "export_sonar_file", fake_export)
@@ -418,6 +425,7 @@ def test_batch_worker_exports_every_file_with_its_own_loader_path(monkeypatch, t
             chunk_size=256,
             default_threshold=0.7,
             downsampling_factor=32,
+            target_samples_per_channel=1024,
             active_dB=False,
             active_hist_equal=False,
             geometry_settings=GeometrySettings(60),
@@ -430,6 +438,6 @@ def test_batch_worker_exports_every_file_with_its_own_loader_path(monkeypatch, t
     worker.run()
 
     assert [call[0] for call in calls] == [path.resolve() for path in sources]
-    assert all(call[1:] == (3857, 32) for call in calls)
+    assert all(call[1:] == (3857, 32, 1024) for call in calls)
     assert len(completed[0][0]) == 2
     assert completed[0][1] == []

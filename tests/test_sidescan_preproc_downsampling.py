@@ -4,6 +4,7 @@ import numpy as np
 from scipy import signal
 
 from sidescantools.sidescan_preproc import SidescanPreprocessor
+from sidescantools.sidescan_preproc import resolve_downsampling_factor
 
 
 class SyntheticSidescanFile:
@@ -49,6 +50,62 @@ class PreprocessorDownsamplingTests(unittest.TestCase):
         self.assertEqual(preprocessor.downsampling_factor, 4)
         self.assertEqual(preprocessor.ping_len, 512)
         self.assertEqual(preprocessor.sonar_data_proc.shape, (2, 3, 512))
+
+    def test_target_resolution_selects_nearest_integer_factor(self):
+        source = SyntheticSidescanFile()
+        source.ping_len = 4096
+
+        self.assertEqual(
+            resolve_downsampling_factor(
+                source, 32, target_samples_per_channel=1024
+            ),
+            4,
+        )
+
+        source.ping_len = 5000
+        self.assertEqual(
+            resolve_downsampling_factor(
+                source, 32, target_samples_per_channel=1024
+            ),
+            5,
+        )
+
+        # Nearest output width is not always obtained by merely rounding the
+        # ideal factor: 1500 / 1 is 1500, while 1500 / 2 is 750 and closer to
+        # the requested 1024 samples.
+        source.ping_len = 1500
+        self.assertEqual(
+            resolve_downsampling_factor(
+                source, 32, target_samples_per_channel=1024
+            ),
+            2,
+        )
+
+    def test_target_resolution_supports_native_and_small_inputs(self):
+        source = SyntheticSidescanFile()
+        self.assertEqual(
+            resolve_downsampling_factor(source, 32, target_samples_per_channel=0),
+            1,
+        )
+        self.assertEqual(
+            resolve_downsampling_factor(source, 32, target_samples_per_channel=512),
+            1,
+        )
+
+    def test_reader_minimum_still_wins_over_lower_user_target(self):
+        source = SyntheticSidescanFile()
+        source.ping_len = 2048
+        source.reader_metadata = {"minimum_processed_samples_per_channel": 512}
+
+        self.assertEqual(
+            resolve_downsampling_factor(source, 32, target_samples_per_channel=256),
+            4,
+        )
+
+    def test_target_resolution_rejects_negative_values(self):
+        source = SyntheticSidescanFile()
+        with self.assertRaisesRegex(ValueError, "target_samples_per_channel"):
+            resolve_downsampling_factor(source, 32, target_samples_per_channel=-1)
 
     def test_bottom_edge_tracking_accepts_a_clicked_start_position(self):
         edges = np.zeros((3, 20), dtype=bool)

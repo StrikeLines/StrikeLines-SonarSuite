@@ -10,18 +10,53 @@ import geopy.distance as geo_dist
 from sidescantools.aux_functions import convert_to_dB, hist_equalization
 
 
-def resolve_downsampling_factor(sidescan_file, requested_factor: int) -> int:
-    """Honor a reader's minimum useful across-track resolution.
+def resolve_downsampling_factor(
+    sidescan_file,
+    requested_factor: int,
+    target_samples_per_channel: int | None = None,
+) -> int:
+    """Resolve the across-track decimation factor for one sonar file.
 
     Some compact formats already store a modest number of samples per ping.
     Applying the legacy GUI default of 32 to those files makes the waterfall
     visibly blocky and magnifies source-pixel overlays. Readers may therefore
     advertise a minimum processed width in ``reader_metadata``.
+
+    When ``target_samples_per_channel`` is supplied, choose the integer factor
+    whose output is closest to that target. A target of zero requests native
+    resolution. ``None`` retains the caller's legacy factor.
     """
 
     requested_factor = int(requested_factor)
     if requested_factor < 1:
         raise ValueError("downsampling_factor must be positive")
+    if target_samples_per_channel is not None:
+        target_samples_per_channel = int(target_samples_per_channel)
+        if target_samples_per_channel < 0:
+            raise ValueError("target_samples_per_channel cannot be negative")
+        if target_samples_per_channel == 0:
+            requested_factor = 1
+        else:
+            source_width = max(1, int(sidescan_file.ping_len))
+            # Test the integer factors on either side of the ideal ratio and
+            # keep the one whose actual ceil(width / factor) result is nearest
+            # the requested width. On an exact tie, prefer the smaller factor
+            # so we retain more sonar information.
+            ratio = source_width / target_samples_per_channel
+            candidate_factors = {
+                max(1, int(np.floor(ratio))),
+                max(1, int(np.ceil(ratio))),
+            }
+            requested_factor = min(
+                candidate_factors,
+                key=lambda factor: (
+                    abs(
+                        int(np.ceil(source_width / factor))
+                        - target_samples_per_channel
+                    ),
+                    factor,
+                ),
+            )
     metadata = getattr(sidescan_file, "reader_metadata", {}) or {}
     minimum_width = metadata.get("minimum_processed_samples_per_channel")
     if minimum_width is None:
