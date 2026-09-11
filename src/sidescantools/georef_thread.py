@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 import logging
 import os
@@ -9,7 +10,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import utm
 import math
-from pyproj import CRS
+from pyproj import CRS, Transformer
 from scipy.signal import savgol_filter
 from scipy import interpolate
 from decimal import Decimal
@@ -23,6 +24,25 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedTrackGeometry:
+    """Channel-independent navigation prepared once for a two-sided swath."""
+
+    valid_ping_mask: np.ndarray
+    source_ping: np.ndarray
+    original_lon: np.ndarray
+    original_lat: np.ndarray
+    original_heading: np.ndarray
+    ping_unique: np.ndarray
+    cog_smooth: np.ndarray
+    nadir_lon: np.ndarray
+    nadir_lat: np.ndarray
+    nadir_east: np.ndarray
+    nadir_north: np.ndarray
+    inverse_transformer: Transformer
+    epsg_code: str
 
 
 def _safe_savgol_filter(values, preferred_window: int, polyorder: int):
@@ -83,6 +103,7 @@ class Georeferencer:
         y_offset: float = 0.0,
         geometry_settings: GeometrySettings | None = None,
         sidescan_file: SidescanFile | None = None,
+        prepared_track: PreparedTrackGeometry | None = None,
     ):
         self.filepath = Path(filepath)
         if sidescan_file is None:
@@ -118,6 +139,7 @@ class Georeferencer:
         self.x_offset = self.geometry_settings.x_offset_m
         self.y_offset = self.geometry_settings.y_offset_m
         self.swath_geometry: SwathGeometry | None = None
+        self.prepared_track = prepared_track
         if proc_data is not None:
             self.proc_data = proc_data
             self.active_proc_data = True
@@ -192,288 +214,231 @@ class Georeferencer:
         if len(ping_unique) < 2:
             raise ValueError("At least two unique navigation fixes are required.")
 
-        cog = np.empty_like(lo)
-        LON_DIFF = np.diff(lo, prepend=np.nan)
-        LAT_DIFF = np.diff(la, prepend=np.nan)
-        for i, (lo, la, cang) in enumerate(zip(LON_DIFF, LAT_DIFF, cog)):
-            # Set first value same as second to avoid nan or false differences
-            if i == 0:
-                course_ang = np.arctan2(LAT_DIFF[1], LON_DIFF[1])
-                cog[i] = course_ang
-            else:
-                course_ang = np.arctan2(la, lo)
-                cog[i] = course_ang
+        longitude_difference = np.diff(lo, prepend=np.nan)
+        latitude_difference = np.diff(la, prepend=np.nan)
+        cog = np.arctan2(latitude_difference, longitude_difference)
         cog[0] = cog[1]
         cog = np.unwrap(cog)
         cog = np.rad2deg(cog)
 
-        # Interpolate cog with univariate to get smooth curve; smoothing factor have been empirically defined
-        spline_degree = min(3, len(ping_unique) - 1)
-        cog_spl = interpolate.UnivariateSpline(
-            ping_unique, cog, k=spline_degree, s=len(ping_unique) / 2
+        # Garmin and some modern systems store a unique navigation fix at
+        # almost every ping. Fitting FITPACK's global smoothing spline through
+        # tens of thousands of already-dense fixes takes tens of seconds and
+        # adds no missing positions. Use linear interpolation for dense tracks;
+        # the Savitzky-Golay pass below still provides the established heading
+        # smoothing. Retain the legacy spline for genuinely sparse navigation.
+        dense_navigation = (
+            len(ping_unique) >= 1024
+            and len(ping_unique) >= 0.8 * len(ping_uniform)
         )
-        cog_intp = cog_spl(ping_uniform)
+        if dense_navigation:
+            cog_intp = np.interp(ping_uniform, ping_unique, cog)
+        else:
+            spline_degree = min(3, len(ping_unique) - 1)
+            cog_spl = interpolate.UnivariateSpline(
+                ping_unique, cog, k=spline_degree, s=len(ping_unique) / 2
+            )
+            cog_intp = cog_spl(ping_uniform)
         self.cog_smooth = _safe_savgol_filter(cog_intp, 100, 3)
 
+    def _prepare_track_geometry(self) -> PreparedTrackGeometry:
+        """Prepare navigation shared by port and starboard geometry."""
+
+        source_ping = np.asarray(self.sidescan_file.packet_no).reshape(-1)
+        longitude = np.asarray(self.sidescan_file.longitude, dtype=float).reshape(-1)
+        latitude = np.asarray(self.sidescan_file.latitude, dtype=float).reshape(-1)
+        heading = np.asarray(self.sidescan_file.sensor_heading, dtype=float).reshape(-1)
+        coordinate_candidate = (
+            np.isfinite(longitude)
+            & np.isfinite(latitude)
+            & (longitude != 0)
+            & (latitude != 0)
+        )
+        valid_ping_mask = (
+            coordinate_candidate
+            & (np.abs(longitude) <= 180)
+            & (latitude >= -80)
+            & (latitude <= 84)
+        )
+        conversion_failures = int(
+            np.count_nonzero(coordinate_candidate & ~valid_ping_mask)
+        )
+        if conversion_failures:
+            logger.warning(
+                "%s: dropped %d navigation fix(es) outside the UTM domain",
+                Path(self.filepath).name,
+                conversion_failures,
+            )
+
+        original_lon = longitude[valid_ping_mask]
+        original_lat = latitude[valid_ping_mask]
+        original_heading = heading[valid_ping_mask]
+        filtered_ping = source_ping[valid_ping_mask]
+        if len(original_lon) < 2:
+            raise ValueError("At least two valid navigation fixes are required.")
+
+        unique_mask = np.ones(len(original_lon), dtype=bool)
+        unique_mask[1:] = (original_lon[1:] != original_lon[:-1]) | (
+            original_lat[1:] != original_lat[:-1]
+        )
+        lon_unique = original_lon[unique_mask]
+        lat_unique = original_lat[unique_mask]
+        ping_unique = np.flatnonzero(unique_mask)
+        if len(lon_unique) < 2:
+            raise ValueError("At least two valid, unique navigation fixes are required.")
+
+        # Determine one projected CRS for the complete survey, then transform
+        # every coordinate in compiled PROJ code. Garmin commonly stores a new
+        # fix for every ping; the prior Python-level utm.from_latlon/to_latlon
+        # loops dominated file loading for those surveys.
+        try:
+            _east, _north, zone, letter = utm.from_latlon(
+                float(lat_unique[0]), float(lon_unique[0])
+            )
+        except (ValueError, OverflowError) as exc:
+            raise ValueError("Unable to determine a UTM zone for sonar navigation") from exc
+        crs = CRS.from_dict(
+            {"proj": "utm", "zone": zone, "south": letter < "N"}
+        )
+        epsg = crs.to_authority()
+        if epsg is None:
+            raise ValueError("Unable to determine a projected CRS for sonar navigation.")
+        epsg_code = f"{epsg[0]}:{epsg[1]}"
+        forward = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+        inverse = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+        east, north = forward.transform(lon_unique, lat_unique)
+        east = np.asarray(east, dtype=float)
+        north = np.asarray(north, dtype=float)
+        valid_projected = np.isfinite(east) & np.isfinite(north)
+        if not np.all(valid_projected):
+            dropped = int(np.count_nonzero(~valid_projected))
+            logger.warning(
+                "%s: dropped %d navigation fix(es) that could not be projected",
+                Path(self.filepath).name,
+                dropped,
+            )
+            east = east[valid_projected]
+            north = north[valid_projected]
+            ping_unique = ping_unique[valid_projected]
+        if len(east) < 2:
+            raise ValueError("At least two valid, unique navigation fixes are required.")
+
+        ping_uniform = np.arange(len(filtered_ping), dtype=float)
+        ping_uniform = np.clip(ping_uniform, ping_unique[0], ping_unique[-1])
+        self.calculate_cog(east, north, ping_unique, ping_uniform)
+        cog_smooth = np.asarray(self.cog_smooth, dtype=float)
+
+        heading_radians = np.deg2rad(cog_smooth[ping_unique])
+        layback = self.geometry_settings.effective_layback_m
+        east_offset = (
+            east
+            - layback * np.sin(heading_radians)
+            + self.x_offset * np.cos(heading_radians)
+        )
+        north_offset = (
+            north
+            - layback * np.cos(heading_radians)
+            + self.y_offset * np.sin(heading_radians)
+        )
+        lon_offset, lat_offset = inverse.transform(east_offset, north_offset)
+
+        spline_degree = min(3, len(ping_unique) - 1)
+        lon_spline = interpolate.make_interp_spline(
+            ping_unique, lon_offset, k=spline_degree
+        )
+        lat_spline = interpolate.make_interp_spline(
+            ping_unique, lat_offset, k=spline_degree
+        )
+        east_spline = interpolate.make_interp_spline(
+            ping_unique, east_offset, k=spline_degree
+        )
+        north_spline = interpolate.make_interp_spline(
+            ping_unique, north_offset, k=spline_degree
+        )
+        nadir_lon = _safe_savgol_filter(lon_spline(ping_uniform), 100, 2)
+        nadir_lat = _safe_savgol_filter(lat_spline(ping_uniform), 100, 2)
+        nadir_east = _safe_savgol_filter(east_spline(ping_uniform), 100, 2)
+        nadir_north = _safe_savgol_filter(north_spline(ping_uniform), 100, 2)
+
+        return PreparedTrackGeometry(
+            valid_ping_mask=valid_ping_mask,
+            source_ping=filtered_ping,
+            original_lon=original_lon,
+            original_lat=original_lat,
+            original_heading=original_heading,
+            ping_unique=ping_unique,
+            cog_smooth=cog_smooth,
+            nadir_lon=np.asarray(nadir_lon),
+            nadir_lat=np.asarray(nadir_lat),
+            nadir_east=np.asarray(nadir_east),
+            nadir_north=np.asarray(nadir_north),
+            inverse_transformer=inverse,
+            epsg_code=epsg_code,
+        )
+
     def prep_data(self, *, build_bulk_nav=True):
-        # Extract metadata for each ping in sonar channel
-        LON_ori = self.sidescan_file.longitude
-        LAT_ori = self.sidescan_file.latitude
-        HEAD_ori = self.sidescan_file.sensor_heading
-        SLANT_RANGE = self.sidescan_file.slant_range[self.channel]
-        GROUND_RANGE = []
-        swath_len = len(self.PING)
         if self.active_proc_data:
             swath_width = len(self.proc_data[0])
         else:
             swath_width = len(self.sidescan_file.data[self.channel][0])
 
-        # Always start from the source packet array so forced preparation is
-        # repeatable after a previous run filtered invalid-navigation pings.
-        source_ping = np.ndarray.flatten(np.array(self.sidescan_file.packet_no))
-        LON_ori = np.ndarray.flatten(np.array(LON_ori))
-        LAT_ori = np.ndarray.flatten(np.array(LAT_ori))
-        HEAD_ori = np.ndarray.flatten(np.array(HEAD_ori))
-        SLANT_RANGE = np.ndarray.flatten(np.array(SLANT_RANGE))
+        track = getattr(self, "prepared_track", None)
+        if track is None:
+            track = self._prepare_track_geometry()
+            self.prepared_track = track
+        self.PING = track.source_ping
+        self.cog_smooth = track.cog_smooth
+        self.epsg_code = track.epsg_code
 
-        # The vertical beam angle is measured down from horizontal, so the
-        # horizontal (ground-range) component is slant * sin(angle).  Keep it
-        # positive; port/starboard direction is applied below.
-        ground_range = [
+        slant_range = np.asarray(
+            self.sidescan_file.slant_range[self.channel], dtype=float
+        ).reshape(-1)[track.valid_ping_mask]
+        ground_range = (
             math.sin(math.radians(self.vertical_beam_angle)) * slant_range
-            for slant_range in SLANT_RANGE
-        ]
-        GROUND_RANGE.append(ground_range)
-        GROUND_RANGE = np.ndarray.flatten(np.array(GROUND_RANGE))
+        )
+        heading_radians = np.deg2rad(track.cog_smooth)
+        direction = 1.0 if self.channel == 1 else -1.0
+        east_outer = (
+            track.nadir_east
+            + direction * ground_range * np.sin(heading_radians)
+        )
+        north_outer = (
+            track.nadir_north
+            - direction * ground_range * np.cos(heading_radians)
+        )
+        east_outer = _safe_savgol_filter(east_outer, 300, 2)
+        north_outer = _safe_savgol_filter(north_outer, 300, 2)
+        outer_lon, outer_lat = track.inverse_transformer.transform(
+            east_outer, north_outer
+        )
+        outer_lon = np.asarray(outer_lon, dtype=float)
+        outer_lat = np.asarray(outer_lat, dtype=float)
+        self.LALO_OUTER = list(zip(outer_lat, outer_lon))
 
-        ZERO_MASK = (
-            np.isfinite(LON_ori)
-            & np.isfinite(LAT_ori)
-            & (LON_ori != 0)
-            & (LAT_ori != 0)
+        x = np.arange(len(track.cog_smooth))
+        x_original = np.arange(len(track.original_heading))
+        self.HEAD_plt = np.column_stack((x, track.cog_smooth))
+        self.HEAD_plt_ori = np.column_stack((x_original, track.original_heading))
+        self.LOLA_plt = np.column_stack((track.nadir_lon, track.nadir_lat))
+        self.LOLA_plt_ori = np.column_stack(
+            (track.original_lon, track.original_lat)
         )
 
-        LON_ori = LON_ori[ZERO_MASK]
-        LAT_ori = LAT_ori[ZERO_MASK]
-        HEAD_ori = HEAD_ori[ZERO_MASK]
-
-        GROUND_RANGE = GROUND_RANGE[ZERO_MASK]
-        SLANT_RANGE = SLANT_RANGE[ZERO_MASK]
-        self.PING = source_ping[ZERO_MASK]
-
-        # Process heading for plotting
-        # Unwrap to avoid jumps when crossing 0/360° degree angle
-        HEAD_ori_rad = np.deg2rad(HEAD_ori)
-        head_unwrapped = np.unwrap(HEAD_ori_rad)
-        head_unwrapped_savgol = _safe_savgol_filter(head_unwrapped, 100, 2)
-        HEAD_savgol = (np.rad2deg(head_unwrapped_savgol)) % 360
-
-        if len(LON_ori) < 2:
-            raise ValueError("At least two valid navigation fixes are required.")
-
-        # Preserve the original ping positions of navigation fixes. Renumbering
-        # unique fixes compresses duplicate runs and shifts the whole track.
-        UNIQUE_MASK = np.ones(len(LON_ori), dtype=bool)
-        UNIQUE_MASK[1:] = (LON_ori[1:] != LON_ori[:-1]) | (
-            LAT_ori[1:] != LAT_ori[:-1]
-        )
-        LON_unique = LON_ori[UNIQUE_MASK]
-        LAT_unique = LAT_ori[UNIQUE_MASK]
-        PING_UNIQUE = np.flatnonzero(UNIQUE_MASK)
-
-        # Convert to UTM to calculate outer swath coordinates for both channels
-        UTM = [None] * len(LAT_unique)
-        for idx, (la, lo) in enumerate(zip(LAT_unique, LON_unique)):
-            try:
-                UTM[idx] = utm.from_latlon(la, lo)
-            except (ValueError, OverflowError):
-                # A malformed isolated fix should not abort an otherwise valid
-                # file. Drop the fix while retaining its original ping index.
-                continue
-
-        valid_utm = np.array([coord is not None for coord in UTM], dtype=bool)
-        conversion_failures = int(np.count_nonzero(~valid_utm))
-        if conversion_failures:
-            logger.warning(
-                "%s: dropped %d navigation fix(es) that could not be converted to UTM",
-                Path(self.filepath).name,
-                conversion_failures,
-            )
-        UTM = [coord for coord in UTM if coord is not None]
-        LON_unique = LON_unique[valid_utm]
-        LAT_unique = LAT_unique[valid_utm]
-        PING_UNIQUE = PING_UNIQUE[valid_utm]
-        if len(UTM) < 2:
-            raise ValueError(
-                "At least two valid, unique navigation fixes are required."
-            )
-
-        EAST = np.asarray([utm_coord[0] for utm_coord in UTM])
-        NORTH = np.asarray([utm_coord[1] for utm_coord in UTM])
-        UTM_ZONE = [utm_coord[2] for utm_coord in UTM]
-        UTM_LET = [utm_coord[3] for utm_coord in UTM]
-        is_southern_hemisphere = UTM_LET[0] < "N"
-        crs = CRS.from_dict(
-            {"proj": "utm", "zone": UTM_ZONE[0], "south": is_southern_hemisphere}
-        )
-        epsg = crs.to_authority()
-        if epsg is None:
-            raise ValueError(
-                "Unable to determine a projected CRS for sonar navigation."
-            )
-        self.epsg_code = f"{epsg[0]}:{epsg[1]}"
-
-        # Evaluate on every retained ping. Clipping avoids extrapolation if an
-        # invalid conversion occurred at either end of the track.
-        PING_uniform = np.arange(len(self.PING), dtype=float)
-        PING_uniform = np.clip(PING_uniform, PING_UNIQUE[0], PING_UNIQUE[-1])
-
-        # calculate cog from east/north
-        self.calculate_cog(EAST, NORTH, PING_UNIQUE, PING_uniform)
-
-        # add offsets following: https://apps.dtic.mil/sti/pdfs/AD1005010.pdf
-        #
-        layback = self.geometry_settings.effective_layback_m
-        north_offset = []
-        east_offset = []
-        lalo_offset = []
-        heading_at_unique_fixes = self.cog_smooth[PING_UNIQUE]
-        for east, north, utm_zone, letter, head in zip(
-            EAST, NORTH, UTM_ZONE, UTM_LET, heading_at_unique_fixes
-        ):
-            east_lay = (
-                east
-                - layback * math.sin(np.deg2rad(head))
-                + self.x_offset * math.cos(np.deg2rad(head))
-            )
-            north_lay = (
-                north
-                - layback * math.cos(np.deg2rad(head))
-                + self.y_offset * math.sin(np.deg2rad(head))
-            )
-            lalo_lay = utm.to_latlon(east_lay, north_lay, utm_zone, letter)
-            east_offset.append(east_lay)
-            north_offset.append(north_lay)
-            lalo_offset.append(lalo_lay)
-
-        Lat_offset, Lon_offset = map(np.array, zip(*lalo_offset))
-
-        # B-Spline lon/lats and filter to obtain esqual-interval, unique coordinates for each ping
-        spline_degree = min(3, len(PING_UNIQUE) - 1)
-        lo_spl = interpolate.make_interp_spline(
-            PING_UNIQUE, Lon_offset, k=spline_degree
-        )
-        la_spl = interpolate.make_interp_spline(
-            PING_UNIQUE, Lat_offset, k=spline_degree
-        )
-
-        # Evaluate spline at equally spaced pings and smooth again with savgol filter
-        lo_intp = lo_spl(PING_uniform)
-        la_intp = la_spl(PING_uniform)
-
-        lo_intp = _safe_savgol_filter(lo_intp, 100, 2)
-        la_intp = _safe_savgol_filter(la_intp, 100, 2)
-
-        # interpolate easting northing to full swath length
-        east_spl = interpolate.make_interp_spline(
-            PING_UNIQUE, east_offset, k=spline_degree
-        )
-        north_spl = interpolate.make_interp_spline(
-            PING_UNIQUE, north_offset, k=spline_degree
-        )
-        east_intp = east_spl(PING_uniform)
-        north_intp = north_spl(PING_uniform)
-        east_intp = _safe_savgol_filter(east_intp, 100, 2)
-        north_intp = _safe_savgol_filter(north_intp, 100, 2)
-
-        # Resize UTM Zone and Letter arrays to fit interpolated array sizes
-        UTM_ZONE = np.resize(UTM_ZONE, len(east_intp))
-        UTM_LET = np.resize(UTM_LET, len(east_intp))
-
-        if self.channel == 1:
-            EAST_OUTER = np.array(
-                [
-                    ground_range * math.sin(np.deg2rad(head)) + east
-                    for ground_range, head, east in zip(
-                        GROUND_RANGE, self.cog_smooth, east_intp
-                    )
-                ]
-            )
-            NORTH_OUTER = np.array(
-                [
-                    (ground_range * math.cos(np.deg2rad(head)) * -1) + north
-                    for ground_range, head, north in zip(
-                        GROUND_RANGE, self.cog_smooth, north_intp
-                    )
-                ]
-            )
-
-            east_out_intp_savgol = _safe_savgol_filter(EAST_OUTER, 300, 2)
-            north_out_intp_savgol = _safe_savgol_filter(NORTH_OUTER, 300, 2)
-
-            self.LALO_OUTER = [
-                utm.to_latlon(east_ch1, north_ch1, utm_zone, utm_let)
-                for (east_ch1, north_ch1, utm_zone, utm_let) in zip(
-                    east_out_intp_savgol, north_out_intp_savgol, UTM_ZONE, UTM_LET
-                )
-            ]
-
-        elif self.channel == 0:
-            EAST_OUTER = np.array(
-                [
-                    (ground_range * math.sin(np.deg2rad(head)) * -1) + east
-                    for ground_range, head, east in zip(
-                        GROUND_RANGE, self.cog_smooth, east_intp
-                    )
-                ]
-            )
-
-            NORTH_OUTER = np.array(
-                [
-                    (ground_range * math.cos(np.deg2rad(head))) + north
-                    for ground_range, head, north in zip(
-                        GROUND_RANGE, self.cog_smooth, north_intp
-                    )
-                ]
-            )
-
-            east_out_intp_savgol = _safe_savgol_filter(EAST_OUTER, 300, 2)
-            north_out_intp_savgol = _safe_savgol_filter(NORTH_OUTER, 300, 2)
-
-            self.LALO_OUTER = [
-                utm.to_latlon(east_ch2, north_ch2, utm_zone, utm_let)
-                for (east_ch2, north_ch2, utm_zone, utm_let) in zip(
-                    east_out_intp_savgol, north_out_intp_savgol, UTM_ZONE, UTM_LET
-                )
-            ]
-
-        la_out_intp, lo_out_intp = map(np.array, zip(*self.LALO_OUTER))
-
-        # Create arrays for heading and coords for plotting in GUI
-        x = range(len(self.cog_smooth))
-        x_ori = range(len(HEAD_ori))
-        self.HEAD_plt = np.column_stack((x, self.cog_smooth))
-        self.HEAD_plt_ori = np.column_stack((x_ori, HEAD_ori))
-        self.LOLA_plt = np.column_stack((lo_intp, la_intp))
-        self.LOLA_plt_ori = np.column_stack((LON_ori, LAT_ori))
-
-        # Keep geometry arrays aligned to original/global ping indices. GeoTIFF
-        # generation still receives only valid pings, in its legacy row order.
         def align_to_original(values):
-            aligned = np.full(len(ZERO_MASK), np.nan, dtype=float)
-            aligned[ZERO_MASK] = values
+            aligned = np.full(len(track.valid_ping_mask), np.nan, dtype=float)
+            aligned[track.valid_ping_mask] = values
             return aligned
 
         self.swath_geometry = SwathGeometry(
             channel=self.channel,
             sample_count=swath_width,
-            valid_ping_mask=ZERO_MASK,
-            nadir_lon=align_to_original(lo_intp),
-            nadir_lat=align_to_original(la_intp),
-            outer_lon=align_to_original(lo_out_intp),
-            outer_lat=align_to_original(la_out_intp),
-            slant_range_m=align_to_original(SLANT_RANGE),
-            ground_range_m=align_to_original(GROUND_RANGE),
+            valid_ping_mask=track.valid_ping_mask,
+            nadir_lon=align_to_original(track.nadir_lon),
+            nadir_lat=align_to_original(track.nadir_lat),
+            outer_lon=align_to_original(outer_lon),
+            outer_lat=align_to_original(outer_lat),
+            slant_range_m=align_to_original(slant_range),
+            ground_range_m=align_to_original(ground_range),
             geometry_settings=self.geometry_settings,
         )
         if build_bulk_nav:

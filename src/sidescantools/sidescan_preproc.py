@@ -257,24 +257,41 @@ class SidescanPreprocessor:
         source_data = np.asarray(self.sidescan_file.data)
         self.num_chunk = int(np.ceil(source_data.shape[1] / self.chunk_size))
 
-        # store old minimal but positive value that might be needed later if filter introduce negative values
-        self.pre_dec_least_val = np.min(source_data[np.where(source_data > 0)])
+        # Store the smallest positive source value for filters that need to
+        # shift negative results later. The where-reduction avoids materializing
+        # a potentially multi-gigabyte array of integer indices and values.
+        source_min = np.min(source_data)
+        source_max = np.max(source_data)
+        if source_max > 0:
+            self.pre_dec_least_val = np.min(
+                source_data,
+                where=source_data > 0,
+                initial=source_max,
+            )
+        else:
+            self.pre_dec_least_val = 0.0
         if self.downsampling_factor != 1:
-            pre_dec_min = np.min(source_data)
+            pre_dec_min = source_min
             downsampled_width = int(
                 np.ceil(self.ping_len / self.downsampling_factor)
             )
             self.sonar_data_proc = np.empty(
                 (source_data.shape[0], source_data.shape[1], downsampled_width),
-                dtype=float,
+                dtype=np.float32,
             )
-            # Filtering is independent for each ping. Work in along-track chunks
-            # to avoid a multi-gigabyte temporary float copy for large sonar files.
+            # Filtering is independent for each ping. Polyphase resampling is
+            # substantially faster for the large factors common in JSF/XTF
+            # files, retains anti-alias filtering, and keeps the working data
+            # in float32. Continue working in along-track chunks to cap peak
+            # memory use for very large recordings.
             for ping_start in range(0, source_data.shape[1], self.chunk_size):
                 ping_stop = min(ping_start + self.chunk_size, source_data.shape[1])
-                decimated = scisig.decimate(
-                    np.asarray(source_data[:, ping_start:ping_stop], dtype=float),
-                    self.downsampling_factor,
+                decimated = scisig.resample_poly(
+                    np.asarray(
+                        source_data[:, ping_start:ping_stop], dtype=np.float32
+                    ),
+                    up=1,
+                    down=self.downsampling_factor,
                     axis=2,
                 )
                 self.sonar_data_proc[:, ping_start:ping_stop] = np.clip(
@@ -282,7 +299,9 @@ class SidescanPreprocessor:
                 )
             self.ping_len = downsampled_width
         else:
-            self.sonar_data_proc = np.array(source_data, dtype=float, copy=True)
+            self.sonar_data_proc = np.array(
+                source_data, dtype=np.float32, copy=True
+            )
 
         # initialiazation of itnern variables
         self._napari_active_click_pos = False
@@ -480,6 +499,7 @@ class SidescanPreprocessor:
         active_dB=False,
         active_hist_equal=False,
         depth_info=None,
+        detect_bottom=True,
     ):
 
         # if depth data is present, this is set here
@@ -503,12 +523,35 @@ class SidescanPreprocessor:
             portside = hist_equalization(portside)
             starboard = hist_equalization(starboard)
 
-        # do initial bottom line detection for start values
-        self.detect_bottom_line_t(
-            threshold_bin=default_threshold,
-            combine_both_sides=True,
-            plotting=False,
-        )
+        if detect_bottom:
+            # Do initial bottom-line detection only when no saved line exists.
+            self.detect_bottom_line_t(
+                threshold_bin=default_threshold,
+                combine_both_sides=True,
+                plotting=False,
+            )
+        else:
+            # Chunk/display arrays still need valid temporary positions before
+            # load_bottom_info() replaces them. Prefer recorded altitude where
+            # available; otherwise use the middle of each channel.
+            ping_count = self.sonar_data_proc.shape[1]
+            if depth_info is not None:
+                depth_samples = np.clip(
+                    np.rint(np.asarray(depth_info, dtype=float)).astype(int),
+                    1,
+                    self.ping_len - 1,
+                )
+                self.dep_info = [depth_samples.copy(), depth_samples.copy()]
+                self.portside_bottom_dist = self.ping_len - depth_samples
+                self.starboard_bottom_dist = depth_samples.copy()
+            else:
+                midpoint = max(1, self.ping_len // 2)
+                self.portside_bottom_dist = np.full(
+                    ping_count, midpoint, dtype=int
+                )
+                self.starboard_bottom_dist = np.full(
+                    ping_count, midpoint, dtype=int
+                )
 
         ## prepare data to chunks
         # build list containing each chunk

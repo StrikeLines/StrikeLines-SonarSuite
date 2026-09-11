@@ -9,7 +9,7 @@ the exact RGB palette used by the Qt waterfall.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import os
 from pathlib import Path
@@ -296,7 +296,7 @@ def default_gain_settings(sonar_path: str | os.PathLike) -> SonarGainSettings:
         overall_gain_db=-5.0,
         tvg_spreading_db_per_decade=5.0,
         tvg_absorption_db_per_m=0.08,
-        auto_tvg_brightness_target_percent=30,
+        auto_tvg_brightness_target_percent=25,
         auto_tvg_active=False,
         auto_tvg_gain_db=(),
         speed_correction_px_per_ping=3.0,
@@ -365,6 +365,7 @@ def prepare_sonar_export(
     geometry_settings: GeometrySettings,
     progress: Callable[[int, str], None] | None = None,
     target_samples_per_channel: int | None = None,
+    slant_range_correction: bool | None = None,
 ) -> PreparedSonarExport:
     """Load one file and reproduce its persisted waterfall for batch export."""
 
@@ -375,6 +376,11 @@ def prepare_sonar_export(
     used_defaults = settings is None
     if settings is None:
         settings = default_gain_settings(source)
+    if slant_range_correction is not None:
+        settings = replace(
+            settings,
+            slant_range_correction_active=bool(slant_range_correction),
+        )
 
     notify(2, "Reading sonar data")
     sidescan_file = SidescanFile(source)
@@ -394,13 +400,14 @@ def prepare_sonar_export(
         downsampling_factor=downsampling_factor,
     )
     depth_info = compute_depth_info(sidescan_file, downsampling_factor)
+    bottom_path = source.parent / f"{source.stem}_bottom_info.npz"
     preprocessor.init_napari_bottom_detect(
         default_threshold,
         active_dB=active_db,
         active_hist_equal=active_hist_equal,
         depth_info=depth_info,
+        detect_bottom=not bottom_path.is_file(),
     )
-    bottom_path = source.parent / f"{source.stem}_bottom_info.npz"
     if bottom_path.is_file():
         load_bottom_info(bottom_path, preprocessor, sidescan_file)
 
@@ -443,16 +450,23 @@ def prepare_sonar_export(
         settings=settings,
     )
     notify(65, "Preparing swath geometry")
-    geometry = {
-        channel: Georeferencer(
-            source,
-            channel=channel,
-            sidescan_file=sidescan_file,
-            geometry_settings=effective_geometry_settings,
-            output_folder=source.parent,
-        ).prepare_swath_geometry()
-        for channel in (0, 1)
-    }
+    port_georeferencer = Georeferencer(
+        source,
+        channel=0,
+        sidescan_file=sidescan_file,
+        geometry_settings=effective_geometry_settings,
+        output_folder=source.parent,
+    )
+    port_geometry = port_georeferencer.prepare_swath_geometry()
+    starboard_geometry = Georeferencer(
+        source,
+        channel=1,
+        sidescan_file=sidescan_file,
+        geometry_settings=effective_geometry_settings,
+        output_folder=source.parent,
+        prepared_track=getattr(port_georeferencer, "prepared_track", None),
+    ).prepare_swath_geometry()
+    geometry = {0: port_geometry, 1: starboard_geometry}
     return PreparedSonarExport(
         rgb=rgb,
         geometry_by_channel=geometry,
@@ -484,6 +498,7 @@ def export_sonar_file(
     overwrite: bool = False,
     progress: Callable[[int, str], None] | None = None,
     target_samples_per_channel: int | None = None,
+    slant_range_correction: bool | None = None,
 ) -> GeoTiffExportResult:
     prepared = prepare_sonar_export(
         sonar_path,
@@ -495,6 +510,7 @@ def export_sonar_file(
         geometry_settings=geometry_settings,
         progress=progress,
         target_samples_per_channel=target_samples_per_channel,
+        slant_range_correction=slant_range_correction,
     )
     result = export_prepared_waterfall(
         sonar_path,

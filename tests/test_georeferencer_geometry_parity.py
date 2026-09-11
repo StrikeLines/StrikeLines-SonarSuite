@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 from pathlib import Path
 import tempfile
 
@@ -168,6 +169,41 @@ class GeoreferencerCharacterizationTests(unittest.TestCase):
 
         np.testing.assert_allclose(port[:, 0], starboard[:, 0], atol=1e-12)
         self.assertFalse(np.allclose(port[:, -1], starboard[:, -1]))
+
+    def test_second_channel_reuses_prepared_track(self):
+        source = SyntheticSidescanFile()
+        settings = GeometrySettings(vertical_beam_angle=60)
+        port = Georeferencer(
+            filepath="synthetic.xtf",
+            sidescan_file=source,
+            channel=0,
+            geometry_settings=settings,
+            output_folder=".",
+        )
+        port_geometry = port.prepare_swath_geometry()
+
+        with mock.patch.object(
+            Georeferencer,
+            "_prepare_track_geometry",
+            side_effect=AssertionError("shared track should prevent recalculation"),
+        ):
+            starboard = Georeferencer(
+                filepath="synthetic.xtf",
+                sidescan_file=source,
+                channel=1,
+                geometry_settings=settings,
+                output_folder=".",
+                prepared_track=port.prepared_track,
+            )
+            starboard_geometry = starboard.prepare_swath_geometry()
+
+        self.assertIs(starboard.prepared_track, port.prepared_track)
+        np.testing.assert_allclose(
+            port_geometry.nadir_lon, starboard_geometry.nadir_lon, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            port_geometry.nadir_lat, starboard_geometry.nadir_lat, atol=1e-12
+        )
 
     def test_shared_geometry_bulk_output_matches_legacy_linspace_order(self):
         for channel in (0, 1):

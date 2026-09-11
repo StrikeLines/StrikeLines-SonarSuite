@@ -48,6 +48,7 @@ from qtpy.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -165,6 +166,7 @@ def _install_options_menu(
     """Install the shared Options > Waterfall target resolution menu."""
 
     options_menu = window.menuBar().addMenu("&Options")
+    window.options_menu = options_menu
     resolution_menu = options_menu.addMenu("Waterfall target resolution")
     action_group = QActionGroup(window)
     action_group.setExclusive(True)
@@ -194,6 +196,67 @@ def _install_options_menu(
     window.waterfall_resolution_action_group = action_group
     window.waterfall_resolution_actions = actions
     window.waterfall_resolution_info_action = info_action
+
+
+def _install_file_menu(
+    window: QMainWindow,
+    on_open: Callable[[], None],
+    on_export_geotiff: Callable[[], None] | None = None,
+) -> None:
+    """Install the shared top-level File menu."""
+
+    file_menu = window.menuBar().addMenu("&File")
+    open_action = QAction("Open sidescan file...", window)
+    open_action.setShortcut("Ctrl+O")
+    open_action.setStatusTip("Open a supported sidescan sonar file")
+    open_action.triggered.connect(on_open)
+    file_menu.addAction(open_action)
+    export_menu = file_menu.addMenu("Export...")
+    export_geotiff_action = QAction("Export GeoTIFF...", window)
+    export_geotiff_action.setStatusTip(
+        "Export one sonar file or a directory as georeferenced GeoTIFF imagery"
+    )
+    export_geotiff_action.setEnabled(on_export_geotiff is not None)
+    if on_export_geotiff is not None:
+        export_geotiff_action.triggered.connect(on_export_geotiff)
+    export_menu.addAction(export_geotiff_action)
+    window.file_menu = file_menu
+    window.open_sidescan_action = open_action
+    window.export_menu = export_menu
+    window.export_geotiff_action = export_geotiff_action
+
+
+def _new_task_progress_dialog(
+    parent: QWidget | None,
+    *,
+    title: str,
+    message: str,
+    determinate: bool,
+) -> QProgressDialog:
+    """Create a prominent, non-cancelable task indicator above the workspace."""
+
+    maximum = 100 if determinate else 0
+    dialog = QProgressDialog(message, "", 0, maximum, parent)
+    dialog.setWindowTitle(title)
+    dialog.setCancelButton(None)
+    dialog.setAutoClose(False)
+    dialog.setAutoReset(False)
+    dialog.setMinimumDuration(0)
+    dialog.setMinimumWidth(420)
+    dialog.setWindowModality(Qt.WindowModality.WindowModal)
+    dialog.show()
+    QApplication.processEvents()
+    return dialog
+
+
+def _configure_normalize_target_button(button: QToolButton, target: int) -> None:
+    """Keep the compact Auto TVG settings button useful and accessible."""
+
+    button.setText("⚙")
+    button.setToolTip(
+        f"Auto TVG brightness target: {target}%. Click to change it."
+    )
+    button.setAccessibleName(f"Auto TVG brightness target: {target}%")
 
 
 class GainProcessingSignals(QObject):
@@ -228,6 +291,80 @@ class GeoTiffExportSignals(QObject):
     finished = Signal(object, object)
 
 
+class GeoTiffExportDialog(QDialog):
+    """Options for a single-file or directory GeoTIFF export."""
+
+    CURRENT_FILE = "current"
+    DIRECTORY = "directory"
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Export GeoTIFF")
+        self.setModal(True)
+        self.setMinimumWidth(440)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.scope_combo = QComboBox()
+        self.scope_combo.addItem("Current sidescan file", self.CURRENT_FILE)
+        self.scope_combo.addItem("All sidescan files in a directory", self.DIRECTORY)
+        form.addRow("Export", self.scope_combo)
+
+        self.crs_combo = QComboBox()
+        self.crs_combo.addItem("WGS 84 (EPSG:4326)", 4326)
+        self.crs_combo.addItem("Web Mercator (EPSG:3857)", 3857)
+        self.crs_combo.setToolTip(
+            "Choose the coordinate reference system embedded in the output raster."
+        )
+        form.addRow("Output CRS", self.crs_combo)
+        layout.addLayout(form)
+
+        self.slant_range_checkbox = QCheckBox("Apply slant range correction")
+        self.slant_range_checkbox.setChecked(True)
+        self.slant_range_checkbox.setToolTip(
+            "Remove the water column using the saved bottom track before mosaicking."
+        )
+        layout.addWidget(self.slant_range_checkbox)
+
+        self.slant_warning = QLabel(
+            "Warning: The mosaic will not be geometrically correct if slant "
+            "range correction is not applied."
+        )
+        self.slant_warning.setWordWrap(True)
+        self.slant_warning.setStyleSheet(
+            "QLabel { color: #8b0000; font-weight: 600; "
+            "background: #fff0f0; border: 1px solid #8b0000; padding: 7px; }"
+        )
+        self.slant_warning.hide()
+        self.slant_range_checkbox.toggled.connect(
+            lambda checked: self.slant_warning.setVisible(not checked)
+        )
+        layout.addWidget(self.slant_warning)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        export_button = QPushButton("Export")
+        export_button.setDefault(True)
+        export_button.clicked.connect(self.accept)
+        button_row.addWidget(cancel_button)
+        button_row.addWidget(export_button)
+        layout.addLayout(button_row)
+
+    @property
+    def export_scope(self) -> str:
+        return str(self.scope_combo.currentData())
+
+    @property
+    def epsg(self) -> int:
+        return int(self.crs_combo.currentData())
+
+    @property
+    def apply_slant_range_correction(self) -> bool:
+        return self.slant_range_checkbox.isChecked()
+
+
 class GeoTiffExportWorker(QRunnable):
     """Export one prepared file or a directory batch off the GUI thread."""
 
@@ -238,6 +375,7 @@ class GeoTiffExportWorker(QRunnable):
         epsg: int,
         loader_settings,
         overwrite: bool,
+        slant_range_correction: bool,
         prepared_current: PreparedSonarExport | None = None,
     ):
         super().__init__()
@@ -245,6 +383,7 @@ class GeoTiffExportWorker(QRunnable):
         self.epsg = int(epsg)
         self.loader_settings = loader_settings
         self.overwrite = overwrite
+        self.slant_range_correction = bool(slant_range_correction)
         self.prepared_current = prepared_current
         self.signals = GeoTiffExportSignals()
 
@@ -302,6 +441,7 @@ class GeoTiffExportWorker(QRunnable):
                         ),
                         overwrite=self.overwrite,
                         progress=report,
+                        slant_range_correction=self.slant_range_correction,
                     )
                 results.append(result)
             except Exception as exc:
@@ -826,16 +966,23 @@ def _prepare_file_geometry(
     geometry_settings: GeometrySettings,
     output_directory: Path,
 ) -> dict:
-    return {
-        channel: Georeferencer(
-            filepath,
-            channel=channel,
-            sidescan_file=sidescan_file,
-            geometry_settings=geometry_settings,
-            output_folder=output_directory,
-        ).prepare_swath_geometry()
-        for channel in (0, 1)
-    }
+    port_georeferencer = Georeferencer(
+        filepath,
+        channel=0,
+        sidescan_file=sidescan_file,
+        geometry_settings=geometry_settings,
+        output_folder=output_directory,
+    )
+    port_geometry = port_georeferencer.prepare_swath_geometry()
+    starboard_geometry = Georeferencer(
+        filepath,
+        channel=1,
+        sidescan_file=sidescan_file,
+        geometry_settings=geometry_settings,
+        output_folder=output_directory,
+        prepared_track=getattr(port_georeferencer, "prepared_track", None),
+    ).prepare_swath_geometry()
+    return {0: port_geometry, 1: starboard_geometry}
 
 
 def _load_sonar_context(
@@ -843,6 +990,7 @@ def _load_sonar_context(
     *,
     settings: SonarLoaderSettings,
     store: ContactStore,
+    progress: Callable[[int, str], None] | None = None,
 ) -> SonarFileContext:
     """Load one sonar file and prepare everything the Qt picker needs for
     it. Used both for the file run_qt_contact_picker() opens initially and
@@ -851,11 +999,17 @@ def _load_sonar_context(
     per-file preparation step lives here exactly once.
     """
 
+    def report(percent: int, message: str) -> None:
+        if progress is not None:
+            progress(percent, message)
+
     # Resolved so this always matches sonar_files_in_directory()'s entries
     # for next/previous lookups, even if the caller passed a relative path.
     filepath = Path(filepath).resolve()
     print(f"Loading {filepath.name}…")
+    report(5, f"Reading {filepath.name}…")
     sidescan_file = SidescanFile(filepath)
+    report(32, "Preparing sonar samples…")
     tow_data = summarize_tow_data(sidescan_file)
     try:
         saved_settings = load_gain_settings(filepath)
@@ -881,16 +1035,18 @@ def _load_sonar_context(
         downsampling_factor=downsampling_factor,
     )
     depth_info = compute_depth_info(sidescan_file, downsampling_factor)
+    bottom_info_path = filepath.parent / f"{filepath.stem}_bottom_info.npz"
+    report(50, "Loading or calculating the bottom track…")
     preprocessor.init_napari_bottom_detect(
         settings.default_threshold,
         active_dB=settings.active_dB,
         active_hist_equal=settings.active_hist_equal,
         depth_info=depth_info,
+        detect_bottom=not bottom_info_path.is_file(),
     )
     # A prior manual correction (or a previous automatic run) saved next to
     # the file takes priority over the fresh automatic guess above -- same
     # convention egn_table_build.py already relies on for this file.
-    bottom_info_path = filepath.parent / f"{filepath.stem}_bottom_info.npz"
     if bottom_info_path.is_file():
         load_bottom_info(bottom_info_path, preprocessor, sidescan_file)
         bottom_info_status = f"Loaded bottom line from {bottom_info_path.name}"
@@ -903,11 +1059,13 @@ def _load_sonar_context(
         bottom_info_status = (
             f"Automatic bottom-line detection (saved to {bottom_info_path.name})"
         )
+    report(72, "Building the waterfall view…")
     raw_waterfall = logical_waterfall(preprocessor, sidescan_file.num_ping)
     slant_range_m = float(np.median(sidescan_file.slant_range))
     built_in_processor = BuiltInGainProcessor(preprocessor, raw_waterfall)
 
     print("Preparing contact geometry…")
+    report(82, "Preparing georeferenced contact geometry…")
     geometry = _prepare_file_geometry(
         filepath,
         sidescan_file,
@@ -925,6 +1083,7 @@ def _load_sonar_context(
     )
     profile_id = store.get_or_create_geometry_profile(geometry_settings)
     store.mark_stale_for_profile(source.id, profile_id)
+    report(98, "Finishing the workspace…")
 
     return SonarFileContext(
         filepath=filepath,
@@ -1026,7 +1185,7 @@ class WaterfallGainModel:
     MAX_TVG_ABSORPTION_DB_PER_M = 0.2
     _NORMALIZE_MAX_SAMPLED_VALUES = 4_000_000
     _NORMALIZE_RANGE_BINS = 128
-    DEFAULT_NORMALIZE_TARGET_PERCENT = 30
+    DEFAULT_NORMALIZE_TARGET_PERCENT = 25
     MIN_NORMALIZE_TARGET_PERCENT = 1
     MAX_NORMALIZE_TARGET_PERCENT = 100
     NORMALIZE_OVERALL_GAIN_DB = -10.0
@@ -1065,10 +1224,22 @@ class WaterfallGainModel:
         *,
         base_pipeline: str,
         slant_range_m: float | None = None,
+        preserve_normalization: bool = False,
     ) -> None:
         source = np.asarray(source, dtype=float)
         if source.ndim != 2 or source.shape[1] < 4 or source.shape[1] % 2:
             raise ValueError("continuous waterfall must have two equal-width channels")
+        keep_normalization = (
+            preserve_normalization
+            and hasattr(self, "_normalization_gain_db")
+            and self._normalization_gain_db.shape == (source.shape[1],)
+        )
+        previous_normalization = (
+            self._normalization_gain_db.copy() if keep_normalization else None
+        )
+        previous_normalization_active = bool(
+            keep_normalization and self._normalization_active
+        )
         self.source = source
         self.base_pipeline = base_pipeline
         # Only update calibration when the caller actually has a new value
@@ -1086,11 +1257,16 @@ class WaterfallGainModel:
             )
         )
         self._range_m = self._sample_fraction * self._reference_range_m
-        # A fitted equalization curve belongs to the exact data being shown.
-        # Processing-mode and file changes call set_source(), so never carry a
-        # residual correction over to a different waterfall.
-        self._normalization_gain_db = np.zeros(source.shape[1], dtype=float)
-        self._normalization_active = False
+        # A fitted equalization curve normally belongs to the exact data being
+        # shown. Same-file processing changes can explicitly retain it so
+        # toggling slant correction or destriping does not silently disable
+        # Auto TVG; new-file calls use the safe clearing default.
+        self._normalization_gain_db = (
+            previous_normalization
+            if previous_normalization is not None
+            else np.zeros(source.shape[1], dtype=float)
+        )
+        self._normalization_active = previous_normalization_active
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -1671,10 +1847,13 @@ class QtContactPickerWindow(QMainWindow):
         self._directory_files = sonar_files_in_directory(context.filepath.parent)
         self.thread_pool = QThreadPool.globalInstance()
         self.processing_worker = None
+        self._processing_progress_dialog = None
         self.bottom_worker = None
+        self._bottom_progress_dialog = None
         self._bottom_worker_source: Path | None = None
         self._pending_full_bottom_recalc = False
         self.geotiff_worker = None
+        self._geotiff_progress_dialog = None
         self._restoring_gain_settings = False
         self._pending_restored_gain_settings = None
         self.gain_settings_save_timer = QTimer(self)
@@ -1685,6 +1864,11 @@ class QtContactPickerWindow(QMainWindow):
         self.interaction_modes.add_listener(self._apply_interaction_mode)
         self.setWindowTitle("SidescanTools - Contact picker (Qt raster)")
         self.resize(1400, 820)
+        _install_file_menu(
+            self,
+            self.open_file,
+            on_export_geotiff=self.open_geotiff_export_dialog,
+        )
         _install_options_menu(
             self,
             selected_target=self.loader_settings.target_samples_per_channel,
@@ -1754,14 +1938,11 @@ class QtContactPickerWindow(QMainWindow):
             "smooth residual correction to dark and blown-out areas."
         )
         self.normalize_tvg_button.clicked.connect(self.normalize_tvg)
-        self.normalize_target_button = QPushButton(
-            "Auto TVG Brightness Target: "
-            f"{self.display.normalize_target_percent}%…"
-        )
-        self.normalize_target_button.setMinimumHeight(36)
-        self.normalize_target_button.setToolTip(
-            "Choose the desired typical waterfall brightness, then normalize "
-            "the current swath to that target."
+        self.normalize_target_button = QToolButton()
+        self.normalize_target_button.setText("⚙")
+        self.normalize_target_button.setFixedSize(36, 36)
+        _configure_normalize_target_button(
+            self.normalize_target_button, self.display.normalize_target_percent
         )
         self.normalize_target_button.clicked.connect(self.set_normalize_target)
 
@@ -1779,10 +1960,6 @@ class QtContactPickerWindow(QMainWindow):
         # here is enough to apply every change live -- this is a cheap view
         # transform, not a re-render, so no debounce timer is needed.
         self.along_track_spin.valueChanged.connect(self.view.set_along_track_scale)
-        self.reset_view_button = QPushButton("Reset view")
-        self.reset_view_button.setMinimumHeight(36)
-        self.reset_view_button.clicked.connect(self.reset_view)
-
         instructions = QLabel(
             "Left-click a sonar return to save a contact. Drag to pan; scroll "
             "the wheel to move up/down the survey. Width always fits the "
@@ -1790,9 +1967,6 @@ class QtContactPickerWindow(QMainWindow):
             "distorted by vessel-speed changes."
         )
 
-        open_button = QPushButton("Open…")
-        open_button.setToolTip("Open a different sonar file")
-        open_button.clicked.connect(self.open_file)
         self.previous_file_button = QPushButton("◀ Previous file")
         self.previous_file_button.clicked.connect(lambda: self._go_to_relative_file(-1))
         self.next_file_button = QPushButton("Next file ▶")
@@ -1803,8 +1977,6 @@ class QtContactPickerWindow(QMainWindow):
         self.next_file_button.clicked.connect(lambda: self._go_to_relative_file(1))
         self.file_position_label = QLabel()
         file_nav = QHBoxLayout()
-        file_nav.addWidget(open_button)
-        file_nav.addSpacing(14)
         file_nav.addWidget(self.previous_file_button)
         file_nav.addWidget(self.next_file_button)
         file_nav.addWidget(self.file_position_label, 1)
@@ -1864,21 +2036,17 @@ class QtContactPickerWindow(QMainWindow):
         contacts_panel_layout.addWidget(self.database_label)
         contacts_panel_layout.addWidget(self._build_layback_group())
         contacts_panel_layout.addWidget(self.contact_dock, 1)
-        contacts_panel_layout.addWidget(self._build_geotiff_export_group())
 
         dock = QDockWidget("Sonar Contacts", self)
         dock.setWidget(contacts_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         processing_dock = QDockWidget("Processing and gain", self)
         processing_dock.setWidget(self._build_processing_panel())
+        # There is only one left workflow panel. Suppress the dock title bar
+        # so it does not look like a selectable tab or draggable handle.
+        processing_dock.setTitleBarWidget(QWidget(processing_dock))
+        self._install_egn_options_menu()
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, processing_dock)
-        bottom_line_dock = QDockWidget("Bottom Line", self)
-        bottom_line_dock.setWidget(self._build_bottom_line_panel())
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, bottom_line_dock)
-        self.tabifyDockWidget(processing_dock, bottom_line_dock)
-        # tabifyDockWidget normally leaves the most recently added dock on
-        # top. Processing and Gain is the primary startup workflow.
-        processing_dock.raise_()
         self._connect_gain_settings_autosave()
         gain_settings_notice = self._restore_file_gain_settings()
         self.contact_dock.contact_deleted.connect(self.refresh_chunk)
@@ -2071,9 +2239,8 @@ class QtContactPickerWindow(QMainWindow):
             WaterfallGainModel.DEFAULT_TVG_ABSORPTION_DB_PER_M
         )
         self.along_track_spin.setValue(WaterfallView.DEFAULT_ALONG_TRACK_SCALE)
-        self.normalize_target_button.setText(
-            "Auto TVG Brightness Target: "
-            f"{self.display.normalize_target_percent}%…"
+        _configure_normalize_target_button(
+            self.normalize_target_button, self.display.normalize_target_percent
         )
         self.egn_path.clear()
         self.destripe_button.setChecked(False)
@@ -2099,9 +2266,8 @@ class QtContactPickerWindow(QMainWindow):
         self.display.set_normalize_target_percent(
             settings.auto_tvg_brightness_target_percent
         )
-        self.normalize_target_button.setText(
-            "Auto TVG Brightness Target: "
-            f"{self.display.normalize_target_percent}%…"
+        _configure_normalize_target_button(
+            self.normalize_target_button, self.display.normalize_target_percent
         )
         egn_path = resolve_egn_table_path(settings, self.filepath)
         self.egn_path.setText(str(egn_path) if egn_path is not None else "")
@@ -2242,12 +2408,27 @@ class QtContactPickerWindow(QMainWindow):
         self._flush_pending_bottom_line_save()
         self._flush_pending_gain_settings_save()
         self.statusBar().showMessage(f"Loading {filepath.name}…")
-        QApplication.processEvents()
+        progress_dialog = _new_task_progress_dialog(
+            self,
+            title="Loading sidescan file",
+            message=f"Opening {filepath.name}…",
+            determinate=True,
+        )
+
+        def report_progress(percent: int, message: str) -> None:
+            progress_dialog.setLabelText(message)
+            progress_dialog.setValue(max(0, min(99, int(percent))))
+            QApplication.processEvents()
+
         try:
             context = _load_sonar_context(
-                filepath, settings=self.loader_settings, store=self.store
+                filepath,
+                settings=self.loader_settings,
+                store=self.store,
+                progress=report_progress,
             )
         except Exception as exc:
+            progress_dialog.close()
             self.statusBar().showMessage(f"Could not open {filepath.name}: {exc}", 8000)
             return
 
@@ -2296,6 +2477,8 @@ class QtContactPickerWindow(QMainWindow):
         self._update_file_position()
         self._sync_waterfall_resolution_menu()
         self._update_status(f"Opened {filepath.name}")
+        progress_dialog.setValue(100)
+        progress_dialog.close()
         if gain_settings_notice:
             self.statusBar().showMessage(gain_settings_notice, 8000)
 
@@ -2432,55 +2615,32 @@ class QtContactPickerWindow(QMainWindow):
                 self._layback_override_m is not None
             )
 
-    def _build_geotiff_export_group(self) -> QGroupBox:
-        group = QGroupBox("GeoTIFF Export")
-        self._emphasize_sidebar_group(group)
-        layout = QVBoxLayout(group)
-        crs_row = QFormLayout()
-        self.geotiff_crs = QComboBox()
-        self.geotiff_crs.addItem("WGS 84 (EPSG:4326)", 4326)
-        self.geotiff_crs.addItem("Web Mercator (EPSG:3857)", 3857)
-        self.geotiff_crs.setToolTip(
-            "Choose the coordinate reference system embedded in the output raster."
-        )
-        crs_row.addRow("Output CRS", self.geotiff_crs)
-        layout.addLayout(crs_row)
+    def open_geotiff_export_dialog(self) -> None:
+        if self.geotiff_worker is not None:
+            QMessageBox.information(
+                self, "Export in progress", "A GeoTIFF export is already running."
+            )
+            return
+        dialog = GeoTiffExportDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        if dialog.export_scope == GeoTiffExportDialog.DIRECTORY:
+            self.export_geotiff_directory(
+                epsg=dialog.epsg,
+                slant_range_correction=dialog.apply_slant_range_correction,
+            )
+        else:
+            self.export_current_geotiff(
+                epsg=dialog.epsg,
+                slant_range_correction=dialog.apply_slant_range_correction,
+            )
 
-        self.export_current_geotiff_button = QPushButton("Export Current File")
-        self.export_current_geotiff_button.setMinimumHeight(36)
-        self.export_current_geotiff_button.setToolTip(
-            "Export the open waterfall beside its source sonar file, using "
-            "the currently displayed processing, TVG, and colors."
-        )
-        self.export_current_geotiff_button.clicked.connect(
-            self.export_current_geotiff
-        )
-        self.export_directory_geotiff_button = QPushButton(
-            "Batch Export Directory…"
-        )
-        self.export_directory_geotiff_button.setMinimumHeight(36)
-        self.export_directory_geotiff_button.setToolTip(
-            "Export every supported sonar file in one folder using each file's own "
-            ".tvg_gain.cfg sidecar."
-        )
-        self.export_directory_geotiff_button.clicked.connect(
-            self.export_geotiff_directory
-        )
-        layout.addWidget(self.export_current_geotiff_button)
-        layout.addWidget(self.export_directory_geotiff_button)
-
-        self.geotiff_progress = QProgressBar()
-        self.geotiff_progress.setRange(0, 100)
-        self.geotiff_progress.setValue(0)
-        self.geotiff_status = QLabel(
-            "Outputs are saved beside each source file as <basename>.tif."
-        )
-        self.geotiff_status.setWordWrap(True)
-        layout.addWidget(self.geotiff_progress)
-        layout.addWidget(self.geotiff_status)
-        return group
-
-    def export_current_geotiff(self) -> None:
+    def export_current_geotiff(
+        self,
+        *,
+        epsg: int = 4326,
+        slant_range_correction: bool = True,
+    ) -> None:
         if self.processing_worker is not None:
             QMessageBox.warning(
                 self,
@@ -2503,18 +2663,27 @@ class QtContactPickerWindow(QMainWindow):
         overwrite = self._confirm_geotiff_overwrite([destination])
         if overwrite is None:
             return
-        prepared = PreparedSonarExport(
-            rgb=np.array(self.display.render_rgb(), copy=True),
-            geometry_by_channel=dict(self.context.geometry),
-            pipeline_description=self.display.pipeline_description,
-        )
+        prepared = None
+        if slant_range_correction == self.slant_range_checkbox.isChecked():
+            prepared = PreparedSonarExport(
+                rgb=np.array(self.display.render_rgb(), copy=True),
+                geometry_by_channel=dict(self.context.geometry),
+                pipeline_description=self.display.pipeline_description,
+            )
         self._start_geotiff_export(
             [self.filepath],
+            epsg=epsg,
+            slant_range_correction=slant_range_correction,
             overwrite=overwrite,
             prepared_current=prepared,
         )
 
-    def export_geotiff_directory(self) -> None:
+    def export_geotiff_directory(
+        self,
+        *,
+        epsg: int = 4326,
+        slant_range_correction: bool = True,
+    ) -> None:
         # If the open file is part of this batch, do not let a pending slider
         # edit miss the sidecar snapshot the worker is about to load.
         self._flush_pending_gain_settings_save()
@@ -2553,7 +2722,12 @@ class QtContactPickerWindow(QMainWindow):
         )
         if overwrite is None:
             return
-        self._start_geotiff_export(files, overwrite=overwrite)
+        self._start_geotiff_export(
+            files,
+            epsg=epsg,
+            slant_range_correction=slant_range_correction,
+            overwrite=overwrite,
+        )
 
     def _confirm_geotiff_overwrite(self, destinations: list[Path]) -> bool | None:
         existing = [path for path in destinations if path.exists()]
@@ -2573,6 +2747,8 @@ class QtContactPickerWindow(QMainWindow):
         self,
         files: list[Path],
         *,
+        epsg: int,
+        slant_range_correction: bool,
         overwrite: bool,
         prepared_current: PreparedSonarExport | None = None,
     ) -> None:
@@ -2581,18 +2757,19 @@ class QtContactPickerWindow(QMainWindow):
                 self, "Export in progress", "A GeoTIFF export is already running."
             )
             return
-        self.export_current_geotiff_button.setEnabled(False)
-        self.export_directory_geotiff_button.setEnabled(False)
-        self.geotiff_crs.setEnabled(False)
-        self.geotiff_progress.setValue(0)
-        self.geotiff_status.setText(
-            f"Starting export of {len(files)} sonar file(s)…"
+        self.export_geotiff_action.setEnabled(False)
+        self._geotiff_progress_dialog = _new_task_progress_dialog(
+            self,
+            title="Exporting GeoTIFF",
+            message=f"Starting export of {len(files)} sonar file(s)…",
+            determinate=True,
         )
         worker = GeoTiffExportWorker(
             files,
-            epsg=int(self.geotiff_crs.currentData()),
+            epsg=epsg,
             loader_settings=self.loader_settings,
             overwrite=overwrite,
+            slant_range_correction=slant_range_correction,
             prepared_current=prepared_current,
         )
         self.geotiff_worker = worker
@@ -2601,23 +2778,25 @@ class QtContactPickerWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     def _geotiff_export_progressed(self, percent: int, message: str) -> None:
-        self.geotiff_progress.setValue(percent)
-        self.geotiff_status.setText(message)
+        self.statusBar().showMessage(message)
+        if self._geotiff_progress_dialog is not None:
+            self._geotiff_progress_dialog.setValue(percent)
+            self._geotiff_progress_dialog.setLabelText(message)
 
     def _geotiff_export_finished(self, results: list, failures: list) -> None:
-        self.export_current_geotiff_button.setEnabled(True)
-        self.export_directory_geotiff_button.setEnabled(True)
-        self.geotiff_crs.setEnabled(True)
+        self.export_geotiff_action.setEnabled(True)
         self.geotiff_worker = None
-        if results:
-            self.geotiff_progress.setValue(100)
+        if self._geotiff_progress_dialog is not None:
+            if results:
+                self._geotiff_progress_dialog.setValue(100)
+            self._geotiff_progress_dialog.close()
+            self._geotiff_progress_dialog = None
         default_count = sum(result.used_default_settings for result in results)
         message = f"Exported {len(results)} GeoTIFF(s)"
         if default_count:
             message += f"; {default_count} used default settings (no sidecar found)"
         if failures:
             message += f"; {len(failures)} failed"
-        self.geotiff_status.setText(message)
         self.statusBar().showMessage(message, 10000)
         if failures:
             details = "\n".join(
@@ -2771,10 +2950,30 @@ class QtContactPickerWindow(QMainWindow):
     def _build_processing_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        layout.setSpacing(6)
+
+        layout.addWidget(self._build_bottom_line_panel())
+
+        slant_group = QGroupBox("Slant Range Correction")
+        self._emphasize_sidebar_group(slant_group)
+        slant_layout = QVBoxLayout(slant_group)
+        slant_layout.setContentsMargins(8, 8, 8, 8)
+        self.slant_range_checkbox = QCheckBox("Apply Slant Range Correction")
+        self.slant_range_checkbox.setMinimumHeight(30)
+        self.slant_range_checkbox.setToolTip(
+            "Remove the water column and project each side onto ground range, "
+            "using the saved bottom-tracking line as the new nadir. This "
+            "setting also applies to GeoTIFF exports."
+        )
+        self.slant_range_checkbox.clicked.connect(self.apply_builtin_processing)
+        slant_layout.addWidget(self.slant_range_checkbox)
+        layout.addWidget(slant_group)
 
         gain_group = QGroupBox("Gain & TVG")
         self._emphasize_sidebar_group(gain_group)
         gain_layout = QVBoxLayout(gain_group)
+        gain_layout.setContentsMargins(8, 8, 8, 8)
+        gain_layout.setSpacing(3)
         gain_layout.addWidget(
             self._sidebar_gain_control("Overall gain", self.gain_slider, self.gain_spin)
         )
@@ -2788,39 +2987,29 @@ class QtContactPickerWindow(QMainWindow):
                 "TVG absorption", self.tvg_absorption_slider, self.tvg_absorption_spin
             )
         )
-        gain_layout.addWidget(self.normalize_tvg_button)
-        gain_layout.addWidget(self.normalize_target_button)
-        gain_layout.addWidget(self.reset_gain_button)
+        gain_actions = QHBoxLayout()
+        gain_actions.setSpacing(5)
+        gain_actions.addWidget(self.normalize_tvg_button, 1)
+        gain_actions.addWidget(self.normalize_target_button)
+        gain_actions.addWidget(self.reset_gain_button, 1)
+        gain_layout.addLayout(gain_actions)
         layout.addWidget(gain_group)
 
-        view_group = QGroupBox("View")
+        view_group = QGroupBox("Speed Correction")
         self._emphasize_sidebar_group(view_group)
         view_layout = QVBoxLayout(view_group)
+        view_layout.setContentsMargins(8, 8, 8, 8)
         view_layout.addWidget(
             self._sidebar_gain_control(
-                "Speed Correction", self.along_track_slider, self.along_track_spin
+                "Along-track scale", self.along_track_slider, self.along_track_spin
             )
         )
-        view_layout.addWidget(self.reset_view_button)
         layout.addWidget(view_group)
-
-        slant_group = QGroupBox("Slant Range Correction")
-        self._emphasize_sidebar_group(slant_group)
-        slant_layout = QVBoxLayout(slant_group)
-        self.slant_range_checkbox = QCheckBox("Apply Slant Range Correction")
-        self.slant_range_checkbox.setMinimumHeight(30)
-        self.slant_range_checkbox.setToolTip(
-            "Remove the water column and project each side onto ground range, "
-            "using the saved bottom-tracking line as the new nadir. This "
-            "setting also applies to GeoTIFF exports."
-        )
-        self.slant_range_checkbox.clicked.connect(self.apply_builtin_processing)
-        slant_layout.addWidget(self.slant_range_checkbox)
-        layout.addWidget(slant_group)
 
         destripe_group = QGroupBox("Destripe Filter")
         self._emphasize_sidebar_group(destripe_group)
         destripe_layout = QVBoxLayout(destripe_group)
+        destripe_layout.setContentsMargins(8, 8, 8, 8)
         self.destripe_button = QPushButton("Apply Destripe Filter")
         self.destripe_button.setCheckable(True)
         self.destripe_button.setMinimumHeight(36)
@@ -2833,11 +3022,9 @@ class QtContactPickerWindow(QMainWindow):
         destripe_layout.addWidget(self.destripe_button)
         layout.addWidget(destripe_group)
 
-        egn_group = QGroupBox("EGN Settings & Options")
-        self._emphasize_sidebar_group(egn_group)
-        egn_layout = QVBoxLayout(egn_group)
-        form = QFormLayout()
-
+        # EGN is intentionally kept out of the main workflow panel. These
+        # lightweight state widgets back the Options > EGN Processing menu
+        # and preserve the existing settings/worker implementation.
         self.processing_mode = QComboBox()
         for label, mode in (
             ("Raw waterfall", BuiltInGainMode.RAW),
@@ -2847,43 +3034,36 @@ class QtContactPickerWindow(QMainWindow):
         self.processing_mode.currentIndexChanged.connect(
             self._processing_mode_changed
         )
-        form.addRow("Processing", self.processing_mode)
 
         self.egn_path = QLineEdit()
         self.egn_path.setPlaceholderText("Select an EGN .npz table")
-        browse_egn = QPushButton("Browse…")
+        browse_egn = QPushButton("Browse…", panel)
         browse_egn.clicked.connect(self.browse_egn_table)
-        build_egn = QPushButton("Build…")
+        build_egn = QPushButton("Build…", panel)
         build_egn.setToolTip(
             "Build a new EGN table from sonar files or a whole folder on disk"
         )
         build_egn.clicked.connect(self.open_egn_table_builder)
-        egn_row = QHBoxLayout()
-        egn_row.addWidget(self.egn_path, 1)
-        egn_row.addWidget(browse_egn)
-        egn_row.addWidget(build_egn)
-        form.addRow("EGN table", egn_row)
         self.egn_browse_button = browse_egn
         self.egn_build_button = build_egn
-        egn_layout.addLayout(form)
-
-        processing_buttons = QHBoxLayout()
-        self.apply_processing_button = QPushButton("Apply")
+        self.apply_processing_button = QPushButton("Apply", panel)
         self.apply_processing_button.clicked.connect(self.apply_builtin_processing)
-        reset_button = QPushButton("Show raw")
-        reset_button.clicked.connect(self.show_raw_waterfall)
-        processing_buttons.addWidget(self.apply_processing_button)
-        processing_buttons.addWidget(reset_button)
-        egn_layout.addLayout(processing_buttons)
-
-        self.processing_progress = QProgressBar()
+        self.processing_progress = QProgressBar(panel)
         self.processing_progress.setRange(0, 100)
         self.processing_progress.setValue(0)
-        self.processing_status = QLabel("Raw display")
+        self.processing_status = QLabel("Raw display", panel)
         self.processing_status.setWordWrap(True)
-        egn_layout.addWidget(self.processing_progress)
-        egn_layout.addWidget(self.processing_status)
-        layout.addWidget(egn_group)
+        for hidden_control in (
+            self.processing_mode,
+            self.egn_path,
+            self.egn_browse_button,
+            self.egn_build_button,
+            self.apply_processing_button,
+            self.processing_progress,
+            self.processing_status,
+        ):
+            hidden_control.hide()
+
         layout.addStretch(1)
         self._processing_mode_changed()
         return panel
@@ -2939,17 +3119,74 @@ class QtContactPickerWindow(QMainWindow):
             "}"
         )
 
+    def _install_egn_options_menu(self) -> None:
+        """Expose the legacy EGN workflow under Options, off the main panel."""
+
+        egn_menu = self.options_menu.addMenu("EGN processing")
+        mode_group = QActionGroup(self)
+        mode_group.setExclusive(True)
+        self.egn_raw_action = QAction("Raw waterfall", self)
+        self.egn_raw_action.setCheckable(True)
+        self.egn_raw_action.triggered.connect(self.show_raw_waterfall)
+        self.egn_mode_action = QAction("Use EGN table", self)
+        self.egn_mode_action.setCheckable(True)
+        self.egn_mode_action.triggered.connect(self._choose_egn_mode)
+        mode_group.addAction(self.egn_raw_action)
+        mode_group.addAction(self.egn_mode_action)
+        egn_menu.addAction(self.egn_raw_action)
+        egn_menu.addAction(self.egn_mode_action)
+        egn_menu.addSeparator()
+
+        self.egn_select_action = QAction("Select EGN table...", self)
+        self.egn_select_action.triggered.connect(self.browse_egn_table)
+        egn_menu.addAction(self.egn_select_action)
+        self.egn_build_action = QAction("Build EGN table...", self)
+        self.egn_build_action.triggered.connect(self.open_egn_table_builder)
+        egn_menu.addAction(self.egn_build_action)
+        self.egn_table_info_action = QAction("No EGN table selected", self)
+        self.egn_table_info_action.setEnabled(False)
+        egn_menu.addAction(self.egn_table_info_action)
+        self.egn_apply_action = QAction("Apply EGN processing", self)
+        self.egn_apply_action.triggered.connect(self.apply_builtin_processing)
+        egn_menu.addAction(self.egn_apply_action)
+        self.egn_mode_action_group = mode_group
+        self.egn_options_menu = egn_menu
+        self.egn_path.textChanged.connect(self._update_egn_menu_state)
+        self._processing_mode_changed()
+
+    def _choose_egn_mode(self) -> None:
+        index = self.processing_mode.findData(BuiltInGainMode.EGN.value)
+        self.processing_mode.setCurrentIndex(index)
+        if not self.egn_path.text().strip():
+            self.browse_egn_table()
+
     def _processing_mode_changed(self, *args) -> None:
         mode = BuiltInGainMode(self.processing_mode.currentData())
         is_egn = mode is BuiltInGainMode.EGN
         self.egn_path.setEnabled(is_egn)
         self.egn_browse_button.setEnabled(is_egn)
+        if hasattr(self, "egn_raw_action"):
+            self.egn_raw_action.setChecked(not is_egn)
+            self.egn_mode_action.setChecked(is_egn)
+            self.egn_apply_action.setEnabled(is_egn)
+            self._update_egn_menu_state()
+
+    def _update_egn_menu_state(self, *args) -> None:
+        if not hasattr(self, "egn_table_info_action"):
+            return
+        path = self.egn_path.text().strip()
+        self.egn_table_info_action.setText(
+            f"Selected: {Path(path).name}" if path else "No EGN table selected"
+        )
 
     def open_egn_table_builder(self) -> None:
         dialog = EGNTableBuilderDialog(self, initial_directory=self.filepath.parent)
         dialog.exec()
         if dialog.result_table_path is not None:
             self.egn_path.setText(str(dialog.result_table_path))
+            self.processing_mode.setCurrentIndex(
+                self.processing_mode.findData(BuiltInGainMode.EGN.value)
+            )
 
     def browse_egn_table(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
@@ -2961,6 +3198,9 @@ class QtContactPickerWindow(QMainWindow):
         if not filename:
             return
         self.egn_path.setText(filename)
+        self.processing_mode.setCurrentIndex(
+            self.processing_mode.findData(BuiltInGainMode.EGN.value)
+        )
 
     def apply_builtin_processing(self) -> None:
         if self.processing_worker is not None:
@@ -2983,6 +3223,8 @@ class QtContactPickerWindow(QMainWindow):
             )
         except Exception as exc:
             self.processing_status.setText(str(exc))
+            self.statusBar().showMessage(f"Could not start processing: {exc}", 8000)
+            QMessageBox.warning(self, "Could not start processing", str(exc))
             return
 
         self.apply_processing_button.setEnabled(False)
@@ -2990,6 +3232,12 @@ class QtContactPickerWindow(QMainWindow):
         self.slant_range_checkbox.setEnabled(False)
         self.processing_progress.setValue(0)
         self.processing_status.setText("Starting processing…")
+        self._processing_progress_dialog = _new_task_progress_dialog(
+            self,
+            title="Processing sonar data",
+            message="Starting processing…",
+            determinate=True,
+        )
         worker = GainProcessingWorker(self.built_in_processor, request)
         self.processing_worker = worker
         worker.signals.progress.connect(self._processing_progressed)
@@ -3000,11 +3248,15 @@ class QtContactPickerWindow(QMainWindow):
     def _processing_progressed(self, percent: int, message: str) -> None:
         self.processing_progress.setValue(percent)
         self.processing_status.setText(message)
+        if self._processing_progress_dialog is not None:
+            self._processing_progress_dialog.setValue(percent)
+            self._processing_progress_dialog.setLabelText(message)
 
     def _processing_finished(self, result) -> None:
         self.display.set_source(
             result.display_data,
             base_pipeline=result.pipeline_description,
+            preserve_normalization=True,
         )
         restore_warning = None
         if self._pending_restored_gain_settings is not None:
@@ -3030,6 +3282,10 @@ class QtContactPickerWindow(QMainWindow):
         self.destripe_button.setEnabled(True)
         self.slant_range_checkbox.setEnabled(True)
         self.processing_worker = None
+        if self._processing_progress_dialog is not None:
+            self._processing_progress_dialog.setValue(100)
+            self._processing_progress_dialog.close()
+            self._processing_progress_dialog = None
         self._schedule_gain_settings_save()
         self._update_status()
 
@@ -3040,12 +3296,16 @@ class QtContactPickerWindow(QMainWindow):
         self.destripe_button.setEnabled(True)
         self.slant_range_checkbox.setEnabled(True)
         self.processing_worker = None
+        if self._processing_progress_dialog is not None:
+            self._processing_progress_dialog.close()
+            self._processing_progress_dialog = None
 
     def show_raw_waterfall(self) -> None:
         self._pending_restored_gain_settings = None
         self.display.set_source(
             self.raw_waterfall,
             base_pipeline="qt-continuous-waterfall-v1|raw",
+            preserve_normalization=True,
         )
         self.destripe_button.setChecked(False)
         self.slant_range_checkbox.setChecked(False)
@@ -3058,8 +3318,11 @@ class QtContactPickerWindow(QMainWindow):
         self._update_status()
 
     def _build_bottom_line_panel(self) -> QWidget:
-        panel = QWidget()
+        panel = QGroupBox("Bottom Tracking")
+        self._emphasize_sidebar_group(panel)
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(5)
         form = QFormLayout()
 
         # Blanking is only ever useful over a fraction of the swath, and the
@@ -3137,14 +3400,23 @@ class QtContactPickerWindow(QMainWindow):
         )
 
         recalc_row = QHBoxLayout()
-        self.recalc_all_button = QPushButton("Recalculate Whole File…")
+        self.recalc_all_button = QPushButton("Recalculate")
         self.recalc_all_button.setToolTip(
             "Explicitly rerun the current bottom settings across the entire "
             "file. Changing any of them already does this automatically "
             "after a short pause."
         )
         self.recalc_all_button.clicked.connect(self.recalc_bottom_whole_file)
-        recalc_row.addWidget(self.recalc_all_button)
+        recalc_row.addWidget(self.recalc_all_button, 1)
+
+        self.edit_bottom_button = QPushButton("Manually Edit")
+        self.edit_bottom_button.setCheckable(True)
+        self.edit_bottom_button.setToolTip(
+            "Drag across the waterfall to manually correct the bottom line. "
+            "Panning and contact-picking are unavailable while this is on."
+        )
+        self.edit_bottom_button.toggled.connect(self._toggle_bottom_edit)
+        recalc_row.addWidget(self.edit_bottom_button, 1)
         layout.addLayout(recalc_row)
 
         altitude_row = QHBoxLayout()
@@ -3174,23 +3446,6 @@ class QtContactPickerWindow(QMainWindow):
         altitude_row.addWidget(self.refine_altitude_button)
         layout.addLayout(altitude_row)
 
-        self.edit_bottom_button = QPushButton("Edit Bottom Line")
-        self.edit_bottom_button.setCheckable(True)
-        self.edit_bottom_button.setToolTip(
-            "Drag across the waterfall to manually correct the bottom line. "
-            "Panning and contact-picking are unavailable while this is on."
-        )
-        self.edit_bottom_button.toggled.connect(self._toggle_bottom_edit)
-        layout.addWidget(self.edit_bottom_button)
-
-        autosave_note = QLabel(
-            "Saved automatically to <file>_bottom_info.npz beside the sonar "
-            "file -- the same file the CLI, EGN table builder, and Napari "
-            "bottom editor use."
-        )
-        autosave_note.setWordWrap(True)
-        layout.addWidget(autosave_note)
-
         # Debounced like bottom_recalc_timer above, but longer -- this one
         # writes to disk, so a burst of drag-edits or slider ticks should
         # settle before it fires rather than saving on every single change.
@@ -3200,9 +3455,7 @@ class QtContactPickerWindow(QMainWindow):
         self.bottom_autosave_timer.timeout.connect(self._autosave_bottom_line)
 
         self.bottom_status_label = QLabel(self.context.bottom_info_status)
-        self.bottom_status_label.setWordWrap(True)
-        layout.addWidget(self.bottom_status_label)
-        layout.addStretch(1)
+        self.bottom_status_label.hide()
         return panel
 
     def _toggle_bottom_edit(self, checked: bool) -> None:
@@ -3338,6 +3591,16 @@ class QtContactPickerWindow(QMainWindow):
         processor_copy = _copy_preprocessor_for_bottom_line(self.preprocessor)
         self._set_bottom_controls_enabled(False)
         self.bottom_status_label.setText(status_message)
+        self.statusBar().showMessage(status_message)
+        if self._bottom_progress_dialog is None:
+            self._bottom_progress_dialog = _new_task_progress_dialog(
+                self,
+                title="Calculating bottom track",
+                message=status_message,
+                determinate=False,
+            )
+        else:
+            self._bottom_progress_dialog.setLabelText(status_message)
         worker = BottomLineRecalcWorker(processor_copy, run_algorithm)
         self.bottom_worker = worker
         self._bottom_worker_source = self.filepath
@@ -3362,6 +3625,7 @@ class QtContactPickerWindow(QMainWindow):
             # A file switch occurred while the worker was running. Never let
             # an old file's arrays overwrite the newly loaded preprocessor.
             self._set_bottom_controls_enabled(True)
+            self._close_bottom_progress_dialog()
             return
         # Whole-object attribute reassignment, never in-place mutation --
         # reassignment is atomic, an in-place slice write on the array the
@@ -3378,6 +3642,10 @@ class QtContactPickerWindow(QMainWindow):
         self.bottom_status_label.setText(
             "Bottom line updated" + self._blanking_warning()
         )
+        self.statusBar().showMessage(
+            "Bottom line updated" + self._blanking_warning(), 5000
+        )
+        self._close_bottom_progress_dialog()
         self._mark_bottom_line_dirty()
 
     def _bottom_recalc_failed(self, message: str) -> None:
@@ -3390,6 +3658,15 @@ class QtContactPickerWindow(QMainWindow):
             QTimer.singleShot(0, self.recalc_bottom_whole_file)
             return
         self.bottom_status_label.setText(f"Bottom line recalculation failed: {message}")
+        self.statusBar().showMessage(
+            f"Bottom line recalculation failed: {message}", 8000
+        )
+        self._close_bottom_progress_dialog()
+
+    def _close_bottom_progress_dialog(self) -> None:
+        if self._bottom_progress_dialog is not None:
+            self._bottom_progress_dialog.close()
+            self._bottom_progress_dialog = None
 
     def _set_bottom_controls_enabled(self, enabled: bool) -> None:
         for widget in (
@@ -3489,10 +3766,15 @@ class QtContactPickerWindow(QMainWindow):
         if not accepted:
             return
         self.display.set_normalize_target_percent(target_percent)
-        self.normalize_target_button.setText(
-            f"Auto TVG Brightness Target: {target_percent}%…"
+        _configure_normalize_target_button(
+            self.normalize_target_button, self.display.normalize_target_percent
         )
         self.normalize_tvg()
+
+    def _update_normalize_target_button(self) -> None:
+        _configure_normalize_target_button(
+            self.normalize_target_button, self.display.normalize_target_percent
+        )
 
     def render_gain(self) -> None:
         self.view.set_image(self.display.render_rgb())
@@ -3611,7 +3893,9 @@ class QtContactPickerStartWindow(QMainWindow):
 
     def __init__(
         self,
-        open_selected_file: Callable[[Path], QtContactPickerWindow],
+        open_selected_file: Callable[
+            [Path, Callable[[int, str], None]], QtContactPickerWindow
+        ],
         *,
         initial_directory: Path | None = None,
         waterfall_target_samples: int | None = None,
@@ -3623,15 +3907,13 @@ class QtContactPickerStartWindow(QMainWindow):
         self.setWindowTitle("SidescanTools - Contact picker (Qt raster)")
         self.resize(1400, 820)
         self.waterfall_target_samples = waterfall_target_samples
+        _install_file_menu(self, self.open_file)
         _install_options_menu(
             self,
             selected_target=self.waterfall_target_samples,
             on_target_changed=self._set_waterfall_target_samples,
         )
 
-        self.open_button = QPushButton("Open…")
-        self.open_button.setToolTip("Open a sonar file")
-        self.open_button.clicked.connect(self.open_file)
         self.previous_file_button = QPushButton("◀ Previous file")
         self.next_file_button = QPushButton("Next file ▶")
         self.previous_file_button.setEnabled(False)
@@ -3639,8 +3921,6 @@ class QtContactPickerStartWindow(QMainWindow):
         self.file_position_label = QLabel("No sonar file selected")
 
         file_nav = QHBoxLayout()
-        file_nav.addWidget(self.open_button)
-        file_nav.addSpacing(14)
         file_nav.addWidget(self.previous_file_button)
         file_nav.addWidget(self.next_file_button)
         file_nav.addWidget(self.file_position_label, 1)
@@ -3662,6 +3942,7 @@ class QtContactPickerStartWindow(QMainWindow):
         processing_message.setWordWrap(True)
         processing_message.setMargin(10)
         processing_dock.setWidget(processing_message)
+        processing_dock.setTitleBarWidget(QWidget(processing_dock))
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, processing_dock)
 
         contacts_dock = QDockWidget("Sonar Contacts", self)
@@ -3677,7 +3958,9 @@ class QtContactPickerStartWindow(QMainWindow):
         contact_layout.addStretch(1)
         contacts_dock.setWidget(contact_group)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, contacts_dock)
-        self.statusBar().showMessage("Ready — select Open… to choose a sonar file")
+        self.statusBar().showMessage(
+            "Ready — choose File > Open sidescan file... to begin"
+        )
 
     def _set_waterfall_target_samples(
         self, target_samples_per_channel: int | None
@@ -3708,14 +3991,28 @@ class QtContactPickerStartWindow(QMainWindow):
             )
             return
         self.statusBar().showMessage(f"Loading {filepath.name}…")
-        QApplication.processEvents()
+        progress_dialog = _new_task_progress_dialog(
+            self,
+            title="Loading sidescan file",
+            message=f"Opening {filepath.name}…",
+            determinate=True,
+        )
+
+        def report_progress(percent: int, message: str) -> None:
+            progress_dialog.setLabelText(message)
+            progress_dialog.setValue(max(0, min(99, int(percent))))
+            QApplication.processEvents()
+
         try:
-            loaded_window = self._open_selected_file(filepath)
+            loaded_window = self._open_selected_file(filepath, report_progress)
         except Exception as exc:
+            progress_dialog.close()
             QMessageBox.critical(self, "Could not open sonar file", str(exc))
             self.statusBar().showMessage("No sonar file selected")
             return
         self._loaded_window = loaded_window
+        progress_dialog.setValue(100)
+        progress_dialog.close()
         loaded_window.show()
         self.close()
 
@@ -3733,6 +4030,7 @@ def run_qt_contact_picker(
     geometry_settings: GeometrySettings | None = None,
     target_samples_per_channel: int | None = None,
     block: bool = True,
+    _progress_callback: Callable[[int, str], None] | None = None,
 ):
     """Open the no-OpenGL contact picker using Qt's raster paint engine.
 
@@ -3749,7 +4047,9 @@ def run_qt_contact_picker(
     if filepath is None:
         initial_directory = Path(work_dir) if work_dir is not None else None
 
-        def open_selected_file(selected: Path) -> QtContactPickerWindow:
+        def open_selected_file(
+            selected: Path, progress: Callable[[int, str], None]
+        ) -> QtContactPickerWindow:
             return run_qt_contact_picker(
                 selected,
                 chunk_size=chunk_size,
@@ -3761,6 +4061,7 @@ def run_qt_contact_picker(
                 contacts_db_path=contacts_db_path,
                 geometry_settings=geometry_settings,
                 block=False,
+                _progress_callback=progress,
             )
 
         window = QtContactPickerStartWindow(
@@ -3793,7 +4094,12 @@ def run_qt_contact_picker(
     )
 
     store = ContactStore(database)
-    context = _load_sonar_context(filepath, settings=loader_settings, store=store)
+    context = _load_sonar_context(
+        filepath,
+        settings=loader_settings,
+        store=store,
+        progress=_progress_callback,
+    )
     display = WaterfallGainModel(context.raw_waterfall, slant_range_m=context.slant_range_m)
     picker = _build_contact_picker(context, store=store, display=display)
 

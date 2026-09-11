@@ -545,39 +545,28 @@ class JSFSonarDataMessage:
         )  # num of sonar values * size
 
     def load_data(self, data):
+        if self.data_format not in (0, 1, 2, 9):
+            raise NotImplementedError(
+                f"JSF sonar data format {self.data_format} is not supported"
+            )
+
+        # JSF sample words are little-endian signed 16-bit integers. Reading
+        # them directly into NumPy avoids constructing a very large Python
+        # tuple in struct.unpack and then copying that tuple into an array.
+        sample_count = self.samples * (2 if self.data_format in (1, 9) else 1)
+        samples = np.frombuffer(data, dtype="<i2", count=sample_count)
 
         if self.data_format == 0:
-            # one short per sample - envelope data
-            fields = struct.unpack(f"{self.samples}h", data)
-
-            self.data = np.array(fields, dtype=np.int16)
-            self.data = np.array(self.data, dtype=np.float32)
+            # One short per sample: envelope data. astype() detaches the array
+            # from the temporary input bytes while producing the historical
+            # float32 result used by the processing pipeline.
+            self.data = samples.astype(np.float32)
             self.data *= 2 ** (-1 * self.weighting)
-
-        elif self.data_format == 1:
-            # two shorts per sample - stored as real (one short), imaginary (one short)
-            fields = struct.unpack(f"{self.samples * 2}h", data)
-
-            self.data = np.array(fields, dtype=np.int16)
-            # TODO: interpretation
-
-        elif self.data_format == 2:
-            # one short per sample - before the matched filter
-            fields = struct.unpack(f"{self.samples}h", data)
-
-            self.data = np.array(fields, dtype=np.int16)
-            # TODO: interpretation
-
-        elif self.data_format == 9:
-            # two shorts per sample - stored as real (one short), imaginary (one short) - before matched filtering
-            fields = struct.unpack(f"{self.samples * 2}h", data)
-
-            self.data = np.array(fields, dtype=np.int16)
-            # TODO: interpretation
-
         else:
-            print("Case not implemented - the seems to be a proprietry format")
-            NotImplementedError()
+            # Formats 1/9 contain interleaved real/imaginary shorts and format
+            # 2 contains pre-matched-filter shorts. Interpretation is still a
+            # future concern, but preserve the legacy flattened int16 values.
+            self.data = samples.copy()
 
 
 class JSFSonarDataPacket:

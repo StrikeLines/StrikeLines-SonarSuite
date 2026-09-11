@@ -13,7 +13,11 @@ class XTFWrapper:
     sonar_data: list = field(default_factory=list)
 
     def __post_init__(self):
-        self.file_header, self.packets = pyxtf.xtf_read(str(self.file_path))
+        # Navigation and attitude required downstream are embedded in the
+        # sonar ping headers, so avoid decoding unrelated XTF packet types.
+        self.file_header, self.packets = pyxtf.xtf_read(
+            str(self.file_path), types=[pyxtf.XTFHeaderType.sonar]
+        )
         self.num_ch = self.file_header.NumberOfSonarChannels
         sonar_packets = self.packets.get(pyxtf.XTFHeaderType.sonar, [])
         if not sonar_packets:
@@ -52,10 +56,25 @@ class XTFWrapper:
                         previous = row
                 self.sonar_data.append(np.asarray(channel_rows))
 
-        # calculate x axis in m for later plotting
-        sec_per_ping = (
-            sonar_packets[0].ping_chan_headers[0].SecondsPerPing
+        # concatenate_channel pads variable-length pings to the widest row.
+        # Build the range axis from that actual output width rather than the
+        # first ping's NumSamples (which can be shorter after a range change).
+        self.num_sample_per_ping = int(self.sonar_data[0].shape[1])
+        declared_ranges = [
+            float(channel_header.SlantRange)
+            for ping in sonar_packets
+            for channel_header in ping.ping_chan_headers[: self.num_ch]
+            if np.isfinite(channel_header.SlantRange)
+            and float(channel_header.SlantRange) > 0
+        ]
+        if declared_ranges:
+            outer_range_m = max(declared_ranges)
+        else:
+            first_header = sonar_packets[0].ping_chan_headers[0]
+            outer_range_m = (
+                float(first_header.SecondsPerPing)
+                * float(sonar_packets[0].SoundVelocity)
+            )
+        self.x_axis_m = np.linspace(
+            0.0, outer_range_m, self.num_sample_per_ping
         )
-        self.num_sample_per_ping = sonar_packets[0].ping_chan_headers[0].NumSamples
-        sos_2 = sonar_packets[0].SoundVelocity
-        self.x_axis_m = np.linspace(0, sec_per_ping * sos_2, self.num_sample_per_ping)

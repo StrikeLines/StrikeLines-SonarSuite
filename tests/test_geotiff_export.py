@@ -218,14 +218,16 @@ def test_saved_gain_render_exactly_matches_qt_waterfall_model():
     np.testing.assert_array_equal(exported_rgb, model.render_rgb())
 
 
-def test_prepare_export_applies_saved_slant_range_setting(monkeypatch, tmp_path):
+def test_prepare_export_slant_override_takes_priority_over_saved_setting(
+    monkeypatch, tmp_path
+):
     from sidescantools import geotiff_export
 
     source = tmp_path / "line.jsf"
     source.touch()
     save_gain_settings(
         source,
-        gain_settings(8, slant_range_correction=True),
+        gain_settings(8, slant_range_correction=False),
     )
     waterfall = np.linspace(0.05, 0.8, 4 * 8).reshape(1, 4, 8)
     sidescan_file = SimpleNamespace(
@@ -279,6 +281,7 @@ def test_prepare_export_applies_saved_slant_range_setting(monkeypatch, tmp_path)
         active_db=False,
         active_hist_equal=False,
         geometry_settings=GeometrySettings(60),
+        slant_range_correction=True,
     )
 
     assert len(requests) == 1
@@ -413,6 +416,7 @@ def test_batch_worker_exports_every_file_with_its_own_loader_path(monkeypatch, t
                 kwargs["epsg"],
                 kwargs["downsampling_factor"],
                 kwargs["target_samples_per_channel"],
+                kwargs["slant_range_correction"],
             )
         )
         return SimpleNamespace(used_default_settings=False)
@@ -431,6 +435,7 @@ def test_batch_worker_exports_every_file_with_its_own_loader_path(monkeypatch, t
             geometry_settings=GeometrySettings(60),
         ),
         overwrite=False,
+        slant_range_correction=True,
     )
     completed = []
     worker.signals.finished.connect(lambda results, failures: completed.append((results, failures)))
@@ -438,6 +443,6 @@ def test_batch_worker_exports_every_file_with_its_own_loader_path(monkeypatch, t
     worker.run()
 
     assert [call[0] for call in calls] == [path.resolve() for path in sources]
-    assert all(call[1:] == (3857, 32, 1024) for call in calls)
+    assert all(call[1:] == (3857, 32, 1024, True) for call in calls)
     assert len(completed[0][0]) == 2
     assert completed[0][1] == []

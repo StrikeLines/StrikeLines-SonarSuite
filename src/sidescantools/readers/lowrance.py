@@ -494,7 +494,13 @@ def _iter_format1_frames(
 
 
 def _iter_indexed_frames(
-    stream: BinaryIO, path: Path, header: LowranceHeader, file_size: int
+    stream: BinaryIO,
+    path: Path,
+    header: LowranceHeader,
+    file_size: int,
+    *,
+    included_channels: frozenset[int] | None = None,
+    channel_counts: dict[int, int] | None = None,
 ) -> Iterator[LowranceFrame]:
     # Formats 2 and 3 carry the frame size in each header, so the walk follows
     # the declared chain rather than a fixed stride.
@@ -507,22 +513,48 @@ def _iter_indexed_frames(
             stream, minimum_header, context=f"frame header at offset {offset}"
         )
         if header.format == 2:
-            frame = _decode_format2_frame(buffer, offset)
-        else:
-            frame = _decode_format3_frame(buffer, offset)
-
-        if frame.frame_size <= frame.header_size:
-            raise LowranceFormatError(
-                f"Navico frame at offset {offset} declares a {frame.frame_size}-byte "
-                f"size, which cannot hold its {frame.header_size}-byte header"
+            frame_size, _previous_frame_size, channel_type = struct.unpack_from(
+                "<HHH", buffer, 28
             )
-        if offset + frame.frame_size > file_size:
+            frame_header_size = _FRAME_HEADER_SIZE[2]
+        else:
+            frame_size, _previous_frame_size, channel_type = struct.unpack_from(
+                "<HHH", buffer, 8
+            )
+            frame_header_size = (
+                _SL3_SHORT_HEADER_SIZE
+                if channel_type in _SL3_SHORT_HEADER_CHANNELS
+                else _FRAME_HEADER_SIZE[3]
+            )
+
+        if frame_size <= frame_header_size:
+            raise LowranceFormatError(
+                f"Navico frame at offset {offset} declares a {frame_size}-byte "
+                f"size, which cannot hold its {frame_header_size}-byte header"
+            )
+        if offset + frame_size > file_size:
             logger.info(
                 "%s: dropping the final frame at offset %d, which is truncated",
                 path.name,
                 offset,
             )
             return
+
+        if channel_counts is not None:
+            channel_counts[channel_type] = channel_counts.get(channel_type, 0) + 1
+
+        # SL2/SL3 files interleave every active transducer. The application
+        # only needs sidescan frames, so seek over other channels before doing
+        # their full telemetry decode or allocating payload bytes.
+        if included_channels is not None and channel_type not in included_channels:
+            stream.seek(frame_size - minimum_header, 1)
+            offset += frame_size
+            continue
+
+        if header.format == 2:
+            frame = _decode_format2_frame(buffer, offset)
+        else:
+            frame = _decode_format3_frame(buffer, offset)
 
         remaining_header = frame.header_size - minimum_header
         if remaining_header:
@@ -563,6 +595,26 @@ def iter_lowrance_frames(filepath: str | Path) -> Iterator[LowranceFrame]:
         stream.seek(header.file_header_size)
         walk = _iter_format1_frames if header.format == 1 else _iter_indexed_frames
         yield from walk(stream, path, header, file_size)
+
+
+def _iter_sidescan_frames(
+    filepath: str | Path, channel_counts: dict[int, int]
+) -> Iterator[LowranceFrame]:
+    """Yield only SL2/SL3 sidescan frames while counting all channels."""
+
+    path = Path(filepath)
+    header = read_lowrance_header(path)
+    file_size = path.stat().st_size
+    with path.open("rb") as stream:
+        stream.seek(header.file_header_size)
+        yield from _iter_indexed_frames(
+            stream,
+            path,
+            header,
+            file_size,
+            included_channels=_SIDESCAN_CHANNELS,
+            channel_counts=channel_counts,
+        )
 
 
 def _fill_samples(
@@ -674,14 +726,17 @@ class LowranceReader:
     ) -> tuple[dict[int, list[LowranceFrame]], dict[int, int]]:
         frames_by_channel: dict[int, list[LowranceFrame]] = {}
         channel_counts: dict[int, int] = {}
-        for frame in iter_lowrance_frames(path):
+        frame_iterator = (
+            iter_lowrance_frames(path)
+            if header.format == 1
+            else _iter_sidescan_frames(path, channel_counts)
+        )
+        for frame in frame_iterator:
             channel = frame.channel_type
-            channel_counts[channel] = channel_counts.get(channel, 0) + 1
             if header.format == 1:
+                channel_counts[channel] = channel_counts.get(channel, 0) + 1
                 # Opted-in format 1 logs are read as one composite channel.
                 channel = CHANNEL_COMPOSITE_SIDESCAN
-            elif channel not in _SIDESCAN_CHANNELS:
-                continue
             frames_by_channel.setdefault(channel, []).append(frame)
         return frames_by_channel, channel_counts
 

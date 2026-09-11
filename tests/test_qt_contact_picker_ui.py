@@ -33,6 +33,7 @@ from sidescantools.layback import TowDataSummary
 from sidescantools.qt_contact_picker_ui import (
     EGNTableBuildCoordinator,
     EGNTableBuilderDialog,
+    GeoTiffExportDialog,
     QtContactPickerWindow,
     QtContactPickerStartWindow,
     SonarFileContext,
@@ -77,12 +78,13 @@ def test_qt_startup_without_a_file_opens_idle_workspace(qtbot, monkeypatch):
     assert isinstance(window, QtContactPickerStartWindow)
     assert window.file_position_label.text() == "No sonar file selected"
     assert not QApplication.instance().windowIcon().isNull()
-    assert window.open_button.isEnabled()
+    assert window.open_sidescan_action.isEnabled()
+    assert window.open_sidescan_action.text() == "Open sidescan file..."
     assert not window.previous_file_button.isEnabled()
     assert not window.next_file_button.isEnabled()
 
 
-def test_idle_workspace_opens_selected_file_through_open_button(
+def test_idle_workspace_opens_selected_file_through_file_menu(
     qtbot, monkeypatch, tmp_path
 ):
     sonar_path = tmp_path / "line.jsf"
@@ -91,7 +93,7 @@ def test_idle_workspace_opens_selected_file_through_open_button(
     loaded_window = QMainWindow()
     qtbot.addWidget(loaded_window)
     window = QtContactPickerStartWindow(
-        lambda path: opened.append(path) or loaded_window
+        lambda path, _progress: opened.append(path) or loaded_window
     )
     qtbot.addWidget(window)
     monkeypatch.setattr(
@@ -100,7 +102,7 @@ def test_idle_workspace_opens_selected_file_through_open_button(
         staticmethod(lambda *args, **kwargs: (str(sonar_path), "")),
     )
 
-    window.open_button.click()
+    window.open_sidescan_action.trigger()
 
     assert opened == [sonar_path]
     assert window._loaded_window is loaded_window
@@ -126,7 +128,7 @@ def test_idle_options_menu_updates_target_resolution(qtbot, monkeypatch):
         lambda target: saved.append(target),
     )
     window = QtContactPickerStartWindow(
-        lambda _path: None,
+        lambda _path, _progress: None,
         waterfall_target_samples=512,
     )
     qtbot.addWidget(window)
@@ -197,11 +199,13 @@ def test_requested_gain_and_scale_defaults_are_applied(qtbot):
     assert model.MAX_OVERALL_GAIN_DB == 20
     assert model.MAX_TVG_SPREADING_DB_PER_DECADE == 34
     assert model.MAX_TVG_ABSORPTION_DB_PER_M == 0.2
-    assert model.normalize_target_percent == 30
+    assert model.normalize_target_percent == 25
     assert view._along_track_scale == 3.0
 
 
-def test_processing_panel_starts_with_gain_and_view_controls(qtbot, tmp_path):
+def test_processing_panel_starts_with_bottom_tracking_then_processing_controls(
+    qtbot, tmp_path
+):
     window = QMainWindow()
     qtbot.addWidget(window)
     window.filepath = tmp_path / "line.jsf"
@@ -233,13 +237,17 @@ def test_processing_panel_starts_with_gain_and_view_controls(qtbot, tmp_path):
         )
     )
     window.normalize_tvg_button = QPushButton("Auto TVG")
-    window.normalize_target_button = QPushButton(
-        "Auto TVG Brightness Target: 30%…"
+    window.normalize_target_button = QToolButton()
+    window.normalize_target_button.setText("⚙")
+    window.normalize_target_button.setToolTip(
+        "Auto TVG brightness target: 25%. Click to change it."
     )
     window.reset_gain_button = QPushButton("Reset TVG")
-    window.reset_view_button = QPushButton("Reset view")
     window._sidebar_gain_control = QtContactPickerWindow._sidebar_gain_control
     window._emphasize_sidebar_group = QtContactPickerWindow._emphasize_sidebar_group
+    bottom_group = QGroupBox("Bottom Tracking")
+    window._emphasize_sidebar_group(bottom_group)
+    window._build_bottom_line_panel = lambda: bottom_group
     window._processing_mode_changed = (
         QtContactPickerWindow._processing_mode_changed.__get__(window)
     )
@@ -254,22 +262,22 @@ def test_processing_panel_starts_with_gain_and_view_controls(qtbot, tmp_path):
     groups = panel.findChildren(
         QGroupBox, options=Qt.FindChildOption.FindDirectChildrenOnly
     )
-    assert [group.title() for group in groups[:5]] == [
-        "Gain & TVG",
-        "View",
+    assert [group.title() for group in groups] == [
+        "Bottom Tracking",
         "Slant Range Correction",
+        "Gain & TVG",
+        "Speed Correction",
         "Destripe Filter",
-        "EGN Settings & Options",
     ]
-    assert all("border: 2px solid" in group.styleSheet() for group in groups[:5])
+    assert all("border: 2px solid" in group.styleSheet() for group in groups)
     assert window.gain_slider.maximum() == 20
     assert window.tvg_spreading_slider.maximum() == 34
     assert window.tvg_absorption_slider.maximum() == 20  # fixed-point 0.20
-    assert window.along_track_slider in groups[1].findChildren(
+    assert window.along_track_slider in groups[3].findChildren(
         type(window.along_track_slider)
     )
-    assert "Speed Correction" in " ".join(
-        label.text() for label in groups[1].findChildren(QLabel)
+    assert "Along-track scale" in " ".join(
+        label.text() for label in groups[3].findChildren(QLabel)
     )
     assert window.slant_range_checkbox.text() == "Apply Slant Range Correction"
     assert not window.slant_range_checkbox.isChecked()
@@ -277,13 +285,14 @@ def test_processing_panel_starts_with_gain_and_view_controls(qtbot, tmp_path):
     assert window.destripe_button.isCheckable()
     assert [
         button.text()
-        for button in groups[0].findChildren(QPushButton)
+        for button in groups[2].findChildren(QPushButton)
     ] == [
         "Auto TVG",
-        "Auto TVG Brightness Target: 30%…",
         "Reset TVG",
     ]
-    assert all(button.width() >= 36 for button in groups[0].findChildren(QToolButton))
+    assert window.normalize_target_button.text() == "⚙"
+    assert "25%" in window.normalize_target_button.toolTip()
+    assert all(button.width() >= 36 for button in groups[2].findChildren(QToolButton))
     assert [
         window.processing_mode.itemData(index)
         for index in range(window.processing_mode.count())
@@ -317,6 +326,7 @@ def test_bottom_controls_recalculate_the_whole_file_after_debounce(qtbot):
     )
     window.context = SimpleNamespace(bottom_info_status="Ready")
     window._fine_control = QtContactPickerWindow._fine_control
+    window._emphasize_sidebar_group = QtContactPickerWindow._emphasize_sidebar_group
     window.recalc_bottom_whole_file = lambda: recalculations.append(True)
     window.refine_bottom_with_altitude = lambda: None
     window._toggle_bottom_edit = lambda checked: None
@@ -327,7 +337,8 @@ def test_bottom_controls_recalculate_the_whole_file_after_debounce(qtbot):
 
     button_text = [button.text() for button in panel.findChildren(QPushButton)]
     assert "Recalculate Current Chunk" not in button_text
-    assert "Recalculate Whole File…" in button_text
+    assert "Recalculate" in button_text
+    assert "Manually Edit" in button_text
     assert window.bottom_recalc_timer.interval() == 400
 
     window.bottom_blanking_spin.setValue(1.5)
@@ -364,21 +375,41 @@ def test_running_bottom_calculation_discards_stale_result_and_runs_latest(qtbot)
     assert "latest" in status.text().lower()
 
 
-def test_geotiff_export_group_has_crs_and_file_or_batch_controls(qtbot):
+def test_geotiff_export_dialog_has_scope_crs_and_default_slant_warning(qtbot):
+    dialog = GeoTiffExportDialog()
+    qtbot.addWidget(dialog)
+
+    assert dialog.windowTitle() == "Export GeoTIFF"
+    assert [dialog.scope_combo.itemData(index) for index in range(2)] == [
+        "current",
+        "directory",
+    ]
+    assert [dialog.crs_combo.itemData(index) for index in range(2)] == [4326, 3857]
+    assert dialog.apply_slant_range_correction is True
+    assert dialog.slant_warning.isHidden()
+
+    dialog.slant_range_checkbox.setChecked(False)
+
+    assert dialog.apply_slant_range_correction is False
+    assert not dialog.slant_warning.isHidden()
+    assert "will not be geometrically correct" in dialog.slant_warning.text()
+
+
+def test_file_menu_exposes_geotiff_export_submenu(qtbot):
     window = QMainWindow()
     qtbot.addWidget(window)
-    window._emphasize_sidebar_group = QtContactPickerWindow._emphasize_sidebar_group
-    window.export_current_geotiff = lambda: None
-    window.export_geotiff_directory = lambda: None
+    opened = []
+    exported = []
+    qt_contact_picker_ui._install_file_menu(
+        window,
+        lambda: opened.append(True),
+        lambda: exported.append(True),
+    )
 
-    group = QtContactPickerWindow._build_geotiff_export_group(window)
-    qtbot.addWidget(group)
-
-    assert group.title() == "GeoTIFF Export"
-    assert "border: 2px solid" in group.styleSheet()
-    assert [window.geotiff_crs.itemData(index) for index in range(2)] == [4326, 3857]
-    assert window.export_current_geotiff_button.text() == "Export Current File"
-    assert window.export_directory_geotiff_button.text() == "Batch Export Directory…"
+    assert window.export_menu.title() == "Export..."
+    assert window.export_geotiff_action.text() == "Export GeoTIFF..."
+    window.export_geotiff_action.trigger()
+    assert exported == [True]
 
 
 def test_layback_group_displays_file_values_and_effective_override(qtbot):
@@ -541,7 +572,7 @@ def test_opening_a_sonar_file_creates_default_gain_settings(qtbot, tmp_path):
     assert saved is not None
     assert saved.source_file == sonar_path.name
     assert saved.processing_mode == "raw"
-    assert saved.auto_tvg_brightness_target_percent == 30
+    assert saved.auto_tvg_brightness_target_percent == 25
 
 
 def test_pending_gain_settings_are_flushed_immediately(qtbot, tmp_path):
@@ -588,7 +619,7 @@ def test_gain_settings_restore_the_exact_auto_tvg_curve(qtbot, tmp_path):
     assert window.display.auto_tvg_active is True
     assert window.display.auto_tvg_gain_db == pytest.approx(correction)
     assert window.along_track_spin.value() == 4.25
-    assert "38%" in window.normalize_target_button.text()
+    assert "38%" in window.normalize_target_button.toolTip()
 
 
 def test_egn_gain_settings_restore_path_and_schedule_processing(qtbot, tmp_path):
@@ -735,6 +766,35 @@ def test_set_source_without_slant_range_m_preserves_existing_calibration():
     assert model._reference_range_m == 200.0
 
 
+def test_same_file_processing_can_preserve_auto_tvg_correction():
+    model = WaterfallGainModel(np.full((20, 40), 0.1), slant_range_m=50.0)
+    model.normalize_tvg()
+    saved_curve = model.auto_tvg_gain_db
+
+    model.set_source(
+        np.full((20, 40), 0.2),
+        base_pipeline="slant-range-corrected",
+        preserve_normalization=True,
+    )
+
+    assert model.auto_tvg_active
+    assert model.auto_tvg_gain_db == pytest.approx(saved_curve)
+
+
+def test_new_file_source_clears_auto_tvg_correction_by_default():
+    model = WaterfallGainModel(np.full((20, 40), 0.1), slant_range_m=50.0)
+    model.normalize_tvg()
+
+    model.set_source(
+        np.full((20, 40), 0.2),
+        base_pipeline="new-file",
+        slant_range_m=75.0,
+    )
+
+    assert not model.auto_tvg_active
+    assert model.auto_tvg_gain_db == ()
+
+
 def test_set_source_with_slant_range_m_updates_calibration_for_a_new_file():
     # Simulates navigating to a different file with a different range
     # setting: calibration must update, not stay pinned to the old file's.
@@ -793,7 +853,7 @@ def test_normalize_tvg_recovers_known_range_attenuation_and_flattens_brightness(
     assert overall == -10.0
     assert spreading == pytest.approx(18.0, abs=0.25)
     assert absorption == pytest.approx(0.12, abs=0.005)
-    assert np.median(corrected) == pytest.approx(0.30, abs=0.02)
+    assert np.median(corrected) == pytest.approx(0.25, abs=0.02)
     assert np.ptp(np.median(corrected, axis=0)) < 0.06
 
 
@@ -825,7 +885,8 @@ def test_normalize_target_button_updates_and_applies_the_target(qtbot, monkeypat
     QtContactPickerWindow.set_normalize_target(window)
 
     assert window.display.normalize_target_percent == 42
-    assert window.normalize_target_button.text() == "Auto TVG Brightness Target: 42%…"
+    assert window.normalize_target_button.text() == "⚙"
+    assert "42%" in window.normalize_target_button.toolTip()
     assert applied == [True]
 
 
@@ -882,10 +943,10 @@ def test_normalize_tvg_raises_dark_areas_and_reduces_blown_out_areas():
     assert after[dark_column] > before[dark_column]
     assert after[bright_column] < before[bright_column]
     assert np.std(after) < np.std(before) * 0.2
-    assert np.percentile(after, 5) > 0.25
+    assert np.percentile(after, 5) > 0.24
     assert np.percentile(after, 95) < 0.35
     assert model.overall_gain_db == WaterfallGainModel.NORMALIZE_OVERALL_GAIN_DB
-    assert "swath-equalized=30pct" in model.pipeline_description
+    assert "swath-equalized=25pct" in model.pipeline_description
 
 
 def test_clear_normalization_removes_the_empirical_gain_curve():

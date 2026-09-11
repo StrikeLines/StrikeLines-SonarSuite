@@ -127,6 +127,29 @@ def test_load_bottom_info_raises_for_a_missing_file(tmp_path):
         load_bottom_info(tmp_path / "does_not_exist.npz", preproc, sidescan_file)
 
 
+def test_saved_bottom_initialization_skips_automatic_detection(monkeypatch, tmp_path):
+    sidescan_file = _SyntheticSidescanFile(
+        tmp_path / "line.rsd", num_ping=6, ping_len=8
+    )
+    preproc = SidescanPreprocessor(
+        sidescan_file, chunk_size=4, downsampling_factor=1
+    )
+
+    def unexpected_detection(*args, **kwargs):
+        raise AssertionError("automatic detection should have been skipped")
+
+    monkeypatch.setattr(preproc, "detect_bottom_line_t", unexpected_detection)
+    preproc.init_napari_bottom_detect(
+        0.7,
+        depth_info=np.full(sidescan_file.num_ping, 3),
+        detect_bottom=False,
+    )
+
+    np.testing.assert_array_equal(preproc.portside_bottom_dist, np.full(6, 5))
+    np.testing.assert_array_equal(preproc.starboard_bottom_dist, np.full(6, 3))
+    assert preproc.napari_fullmat.shape == (2, 4, 16)
+
+
 def test_compute_depth_info_returns_none_when_no_depth_logged(tmp_path):
     sidescan_file = _SyntheticSidescanFile(tmp_path / "line.jsf")
     sidescan_file.depth = np.zeros(sidescan_file.num_ping)
